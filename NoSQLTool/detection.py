@@ -6,32 +6,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-from .config import GITHUB_RAW_BASE, CACHE_DIR, FETCH_TIMEOUT
+from .config import (
+    GITHUB_RAW_BASE, CACHE_DIR, FETCH_TIMEOUT,
+)
 from .payloads.resolver import resolve_payload_url
 from .payloads.cache import download_if_updated
 from .payloads.loader import load_payloads
+from .engines import get_engine_strategy
+from .base_analysis import ResponseInfo as BaseResponseInfo
+
+# Re-export ResponseInfo para compatibilidad
+ResponseInfo = BaseResponseInfo
 
 DEFAULT_DETECTION_TYPES = ("error_based", "time_based", "boolean_based")
-TIME_BASED_MIN_DELAY_SECONDS = 1.0
-TIME_BASED_MIN_FACTOR = 2.0
-BOOLEAN_BASED_DIFF_RATIO = 0.35
-ERROR_KEYWORDS = (
-    "neo4j",
-    "cypher",
-    "syntaxerror",
-    "exception",
-    "stack trace",
-    "databaseerror",
-)
-ERROR_HINTS = (
-    "error",
-    "errors",
-    "traceback",
-    "failed",
-    "invalid input",
-    "query cannot be",
-    "unexpected",
-)
 
 
 @dataclass
@@ -49,13 +36,6 @@ class TestCase:
     payload: str
     param_location: str  # "query" o "body"
     payload_source: str
-
-
-@dataclass
-class ResponseInfo:
-    status_code: int
-    body: str
-    elapsed: float
 
 
 @dataclass
@@ -179,6 +159,28 @@ def extract_endpoints(spec: Dict[str, Any], target_path: Optional[str] = None) -
     return endpoints
 
 
+def _get_engine_strategy(engine: str):
+    """Obtiene la estrategia especializada para un motor NoSQL.
+    
+    Soporta importación dinámica de estrategias especializadas como CouchDB.
+    
+    Args:
+        engine: Nombre del motor NoSQL
+        
+    Returns:
+        Instancia de NoSQLEngineStrategy
+    """
+    engine_lower = engine.lower()
+    
+    # Importación dinámica de CouchDB si es necesario
+    if "couchdb" in engine_lower or "couch" in engine_lower:
+        from .couchdb_detection import CouchDBStrategy
+        return CouchDBStrategy()
+    
+    # Para otros motores, usar la función estándar
+    return get_engine_strategy(engine)
+
+
 def _send_request(
     base_url: str,
     endpoint: Endpoint,
@@ -200,178 +202,6 @@ def _send_request(
     except requests.RequestException as e:
         elapsed = time.time() - start
         return ResponseInfo(status_code=0, body=str(e), elapsed=elapsed)
-
-
-def _infer_boolean_intent(payload: str) -> Optional[str]:
-    normalized = payload.lower().replace(" ", "")
-    true_markers = ("or1=1", "'1'='1", "true")
-    false_markers = ("or1=0", "'1'='0", "false")
-
-    if any(marker in normalized for marker in true_markers):
-        return "true"
-    if any(marker in normalized for marker in false_markers):
-        return "false"
-    return None
-
-
-def _relative_body_diff(base_len: int, inj_len: int) -> float:
-    denominator = max(base_len, 1)
-    return abs(inj_len - base_len) / denominator
-
-
-def _extract_error_score(response: ResponseInfo) -> int:
-    score = 0
-
-    if response.status_code >= 500:
-        score += 5
-    elif response.status_code >= 400:
-        score += 2
-    elif response.status_code == 0:
-        score += 1
-
-    text = (response.body or "").lower()
-
-    for keyword in ERROR_KEYWORDS:
-        if keyword in text:
-            score += 2
-
-    for hint in ERROR_HINTS:
-        if hint in text:
-            score += 1
-
-    # Si la respuesta parece JSON de error, sumar evidencia extra.
-    try:
-        parsed = json.loads(response.body)
-        if isinstance(parsed, dict):
-            error_keys = {"error", "errors", "exception", "message", "stack", "stacktrace", "code"}
-            matched = error_keys.intersection({k.lower() for k in parsed.keys()})
-            if matched:
-                score += 2
-    except (TypeError, ValueError, json.JSONDecodeError):
-        pass
-
-    return score
-
-
-def _analyze_error_based(baseline: ResponseInfo, injected: ResponseInfo) -> Tuple[bool, Optional[str]]:
-    # Regla fuerte 1: error interno nuevo tras inyeccion.
-    if baseline.status_code < 500 <= injected.status_code:
-        return True, "Posible inyeccion NoSQL (error-based: 5xx nuevo en respuesta inyectada)"
-
-    base_score = _extract_error_score(baseline)
-    inj_score = _extract_error_score(injected)
-    score_delta = inj_score - base_score
-
-    # Regla fuerte 2: salto consistente de evidencia de error.
-    if inj_score >= 7 and score_delta >= 3:
-        return True, "Posible inyeccion NoSQL (error-based: fuerte evidencia de error de BD tras payload)"
-
-    # Regla fuerte 3: misma clase HTTP pero aparece texto de error de base de datos.
-    base_text = (baseline.body or "").lower()
-    inj_text = (injected.body or "").lower()
-    inj_has_db_error = any(k in inj_text for k in ERROR_KEYWORDS)
-    base_has_db_error = any(k in base_text for k in ERROR_KEYWORDS)
-    if inj_has_db_error and not base_has_db_error:
-        return True, "Posible inyeccion NoSQL (error-based: mensaje de error de motor/consulta)"
-
-    # Fallback robusto (no generico): diferencia material de error aunque no haya 5xx.
-    if score_delta >= 5:
-        return True, "Posible inyeccion NoSQL (error-based: incremento material de señales de error)"
-
-    return False, None
-
-
-def _analyze_responses(
-    baseline: ResponseInfo,
-    injected: ResponseInfo,
-    payload_source: str,
-    payload: str,
-) -> Tuple[bool, Optional[str]]:
-    source = (payload_source or "").lower()
-
-    # Heuristica especifica: error-based
-    if source == "error_based":
-        return _analyze_error_based(baseline, injected)
-
-    # Heuristica especifica: time-based
-    if source == "time_based":
-        if baseline.status_code != 0 and injected.status_code != 0:
-            delta = injected.elapsed - baseline.elapsed
-            if delta >= max(TIME_BASED_MIN_DELAY_SECONDS, baseline.elapsed * TIME_BASED_MIN_FACTOR):
-                return True, "Posible inyeccion NoSQL (time-based: incremento anomalo de latencia)"
-
-    # Heuristica especifica: boolean-based
-    if source == "boolean_based":
-        base_len = len(baseline.body)
-        inj_len = len(injected.body)
-        diff_ratio = _relative_body_diff(base_len, inj_len)
-        intent = _infer_boolean_intent(payload)
-
-        if baseline.status_code != injected.status_code:
-            return True, "Posible inyeccion NoSQL (boolean-based: cambio de codigo HTTP)"
-
-        if intent == "true" and base_len > 0 and inj_len >= int(base_len * 1.2):
-            return True, "Posible inyeccion NoSQL (boolean-based: condicion TRUE altera el resultado)"
-
-        if intent == "false" and base_len > 0 and inj_len <= int(base_len * 0.8):
-            return True, "Posible inyeccion NoSQL (boolean-based: condicion FALSE altera el resultado)"
-
-        if diff_ratio >= BOOLEAN_BASED_DIFF_RATIO:
-            return True, "Posible inyeccion NoSQL (boolean-based: diferencia relevante en respuesta)"
-
-    # Cambios importantes en longitud de respuesta
-    base_len = len(baseline.body)
-    inj_len = len(injected.body)
-
-    if base_len == 0 and inj_len > 0:
-        return True, "Posible inyeccion NoSQL (respuesta vacia vs no vacia)"
-
-    if base_len > 0 and inj_len / base_len > 1.5:
-        return True, "Posible inyeccion NoSQL (respuesta significativamente mas grande)"
-
-    # Cambios de codigo HTTP relevantes
-    if baseline.status_code != injected.status_code:
-        return True, "Posible inyeccion NoSQL (cambio de codigo HTTP)"
-
-    return False, None
-
-
-def _run_single_test_case(base_url: str, test_case: TestCase) -> TestResult:
-    # valores base genericos
-    baseline_params = {name: "test" for name in test_case.endpoint.query_params}
-    baseline_body = {name: "test" for name in test_case.endpoint.body_fields}
-
-    # peticion base sin payload malicioso
-    baseline_resp = _send_request(base_url, test_case.endpoint, baseline_params, baseline_body or None)
-
-    # peticion con payload en el parametro especifico
-    injected_params = baseline_params.copy()
-    injected_body = baseline_body.copy()
-
-    if test_case.param_location == "query":
-        injected_params[test_case.param_name] = test_case.payload
-    else:
-        injected_body[test_case.param_name] = test_case.payload
-
-    injected_resp = _send_request(base_url, test_case.endpoint, injected_params, injected_body or None)
-
-    vulnerable, reason = _analyze_responses(
-        baseline_resp,
-        injected_resp,
-        test_case.payload_source,
-        test_case.payload,
-    )
-
-    return TestResult(
-        endpoint=test_case.endpoint,
-        param_name=test_case.param_name,
-        payload=test_case.payload,
-        payload_source=test_case.payload_source,
-        vulnerable=vulnerable,
-        reason=reason,
-        baseline=baseline_resp,
-        injected=injected_resp,
-    )
 
 
 def _load_payloads_for_engine(engine: str, mode: str, payload_file: Optional[str] = None) -> List[str]:
@@ -462,6 +292,108 @@ def build_test_cases(endpoints: List[Endpoint], payload_sets: Dict[str, List[str
     return cases
 
 
+def _run_single_test_case(base_url: str, test_case: TestCase, engine: str = "neo4j") -> TestResult:
+    """Ejecuta un caso de prueba de inyección NoSQL.
+    
+    Delega el análisis a la estrategia especializada del motor.
+    """
+    strategy = _get_engine_strategy(engine)
+    
+    # Valores base genéricos
+    baseline_params = {name: "test" for name in test_case.endpoint.query_params}
+    baseline_body = {name: "test" for name in test_case.endpoint.body_fields}
+
+    # Petición baseline
+    baseline_resp = _send_request(base_url, test_case.endpoint, baseline_params, baseline_body or None)
+
+    # Petición con payload
+    injected_params = baseline_params.copy()
+    injected_body = baseline_body.copy()
+
+    if test_case.param_location == "query":
+        injected_params[test_case.param_name] = test_case.payload
+    else:
+        injected_body[test_case.param_name] = test_case.payload
+
+    injected_resp = _send_request(base_url, test_case.endpoint, injected_params, injected_body or None)
+
+    vulnerable = False
+    reason = None
+    
+    # Análisis delegado a la estrategia
+    if test_case.payload_source == "boolean_based":
+        true_payload, false_payload = strategy.generate_boolean_pair(test_case.payload)
+        
+        if true_payload and false_payload:
+            neutral_payload = strategy.generate_neutral_payload(test_case.payload)
+            
+            # Preparar variantes
+            true_params = baseline_params.copy()
+            true_body = baseline_body.copy()
+            false_params = baseline_params.copy()
+            false_body = baseline_body.copy()
+            neutral_params = baseline_params.copy()
+            neutral_body = baseline_body.copy()
+            
+            param_attr = test_case.param_name
+            if test_case.param_location == "query":
+                true_params[param_attr] = true_payload
+                false_params[param_attr] = false_payload
+                neutral_params[param_attr] = neutral_payload
+            else:
+                true_body[param_attr] = true_payload
+                false_body[param_attr] = false_payload
+                neutral_body[param_attr] = neutral_payload
+            
+            true_resp = _send_request(base_url, test_case.endpoint, true_params, true_body or None)
+            false_resp = _send_request(base_url, test_case.endpoint, false_params, false_body or None)
+            neutral_resp = _send_request(base_url, test_case.endpoint, neutral_params, neutral_body or None)
+            
+            # Análisis avanzado
+            vulnerable, reason = strategy.analyze_boolean_based_advanced(
+                neutral_resp, true_resp, false_resp
+            )
+            
+            if vulnerable:
+                return TestResult(
+                    endpoint=test_case.endpoint,
+                    param_name=test_case.param_name,
+                    payload=test_case.payload,
+                    payload_source=test_case.payload_source,
+                    vulnerable=True,
+                    reason=reason,
+                    baseline=neutral_resp,
+                    injected=true_resp,
+                )
+        
+        # Fallback
+        if not vulnerable:
+            vulnerable, reason = strategy.analyze_boolean_based(baseline_resp, injected_resp, test_case.payload)
+    
+    elif test_case.payload_source == "error_based":
+        vulnerable, reason = strategy.analyze_error_based(baseline_resp, injected_resp)
+    
+    elif test_case.payload_source == "time_based":
+        vulnerable, reason = strategy.analyze_time_based(baseline_resp, injected_resp)
+    
+    else:
+        # Análisis genérico
+        if baseline_resp.status_code != injected_resp.status_code:
+            vulnerable = True
+            reason = f"Cambio de status code: {baseline_resp.status_code} -> {injected_resp.status_code}"
+
+    return TestResult(
+        endpoint=test_case.endpoint,
+        param_name=test_case.param_name,
+        payload=test_case.payload,
+        payload_source=test_case.payload_source,
+        vulnerable=vulnerable,
+        reason=reason,
+        baseline=baseline_resp,
+        injected=injected_resp,
+    )
+
+
 def run_detection(
     swagger_path: str,
     engine: str = "neo4j",
@@ -472,21 +404,6 @@ def run_detection(
     max_workers: int = 10,
     base_url_override: Optional[str] = None,
 ) -> List[TestResult]:
-    """Ejecuta la deteccion de posibles inyecciones NoSQL.
-
-    - swagger_path: ruta local al archivo swagger.json
-    - engine: motor NoSQL (mongo, couchdb, neo4j, ...)
-    - mode: tipo de payloads (detection / exploitation)
-        - payload_file: nombre del json dentro de engine/mode (ej. "error_based" o "error_based.json")
-            Si se indica, solo se usa ese archivo.
-        - detection_types: lista de tipos de deteccion a usar cuando mode="detection"
-            (por defecto: error_based, time_based, boolean_based).
-    - target_path: si se indica, solo prueba ese endpoint (por ejemplo, "/users")
-    - max_workers: numero maximo de hilos en paralelo
-    - base_url_override: si se indica, se usara esta URL base
-      en lugar de la definida en el swagger (ej. "http://localhost:3000")
-    """
-
     spec = load_swagger_from_file(swagger_path)
     if base_url_override:
         base_url = base_url_override.rstrip("/")
@@ -513,7 +430,7 @@ def run_detection(
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_case = {
-            executor.submit(_run_single_test_case, base_url, case): case
+            executor.submit(_run_single_test_case, base_url, case, engine): case
             for case in test_cases
         }
 
