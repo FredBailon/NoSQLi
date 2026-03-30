@@ -1,5 +1,8 @@
 import json
+import os
+import re
 import time
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,31 +10,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 from .config import GITHUB_RAW_BASE, CACHE_DIR, FETCH_TIMEOUT
-from .payloads.resolver import resolve_payload_url
+from .payloads.resolver import normalize_engine, resolve_payload_urls
 from .payloads.cache import download_if_updated
 from .payloads.loader import load_payloads
+from .engines.base import EngineProfile
+from .engines.registry import get_engine_profile
 
 DEFAULT_DETECTION_TYPES = ("error_based", "time_based", "boolean_based")
-TIME_BASED_MIN_DELAY_SECONDS = 1.0
-TIME_BASED_MIN_FACTOR = 2.0
-BOOLEAN_BASED_DIFF_RATIO = 0.35
-ERROR_KEYWORDS = (
-    "neo4j",
-    "cypher",
-    "syntaxerror",
-    "exception",
-    "stack trace",
-    "databaseerror",
-)
-ERROR_HINTS = (
-    "error",
-    "errors",
-    "traceback",
-    "failed",
-    "invalid input",
-    "query cannot be",
-    "unexpected",
-)
 
 
 @dataclass
@@ -49,6 +34,16 @@ class TestCase:
     payload: str
     param_location: str  # "query" o "body"
     payload_source: str
+
+
+@dataclass
+class BooleanPairCase:
+    endpoint: Endpoint
+    param_name: str
+    param_location: str  # "query" o "body"
+    true_payload: str
+    false_payload: str
+    payload_source: str = "boolean_based"
 
 
 @dataclass
@@ -202,10 +197,10 @@ def _send_request(
         return ResponseInfo(status_code=0, body=str(e), elapsed=elapsed)
 
 
-def _infer_boolean_intent(payload: str) -> Optional[str]:
+def _infer_boolean_intent(payload: str, profile: EngineProfile) -> Optional[str]:
     normalized = payload.lower().replace(" ", "")
-    true_markers = ("or1=1", "'1'='1", "true")
-    false_markers = ("or1=0", "'1'='0", "false")
+    true_markers = profile.boolean_true_markers
+    false_markers = profile.boolean_false_markers
 
     if any(marker in normalized for marker in true_markers):
         return "true"
@@ -219,7 +214,207 @@ def _relative_body_diff(base_len: int, inj_len: int) -> float:
     return abs(inj_len - base_len) / denominator
 
 
-def _extract_error_score(response: ResponseInfo) -> int:
+def _normalized_response_text(body: str) -> str:
+    content = body or ""
+    try:
+        parsed = json.loads(content)
+        return json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return " ".join(content.split())
+
+
+def _response_similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, _normalized_response_text(a), _normalized_response_text(b)).ratio()
+
+
+def _extract_top_level_json_keys(body: str) -> Optional[set]:
+    try:
+        parsed = json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    if isinstance(parsed, dict):
+        return {str(k) for k in parsed.keys()}
+    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+        keys = set()
+        for item in parsed[:20]:
+            if isinstance(item, dict):
+                keys.update(str(k) for k in item.keys())
+        return keys or None
+    return None
+
+
+def _json_structure_similarity(a: str, b: str) -> Optional[float]:
+    keys_a = _extract_top_level_json_keys(a)
+    keys_b = _extract_top_level_json_keys(b)
+
+    if keys_a is None or keys_b is None:
+        return None
+
+    union = keys_a.union(keys_b)
+    if not union:
+        return 1.0
+
+    return len(keys_a.intersection(keys_b)) / len(union)
+
+
+def _average(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def _representative_response(samples: List[ResponseInfo]) -> ResponseInfo:
+    if not samples:
+        return ResponseInfo(status_code=0, body="", elapsed=0.0)
+
+    ordered = sorted(samples, key=lambda r: r.elapsed)
+    return ordered[len(ordered) // 2]
+
+
+def _build_boolean_pairs(payloads: List[str], profile: EngineProfile) -> List[Tuple[str, str]]:
+    true_payloads: List[str] = []
+    false_payloads: List[str] = []
+
+    for payload in payloads:
+        intent = _infer_boolean_intent(payload, profile)
+        if intent == "true":
+            true_payloads.append(payload)
+        elif intent == "false":
+            false_payloads.append(payload)
+
+    if true_payloads and not false_payloads:
+        for true_payload in true_payloads:
+            generated_false = _generate_false_payload_from_true(true_payload)
+            if generated_false:
+                false_payloads.append(generated_false)
+
+    pair_count = min(len(true_payloads), len(false_payloads))
+    return [(true_payloads[i], false_payloads[i]) for i in range(pair_count)]
+
+
+def _generate_false_payload_from_true(payload: str) -> Optional[str]:
+    if not payload:
+        return None
+
+    transformed = payload
+    replacements = [
+        (r"(?i)\b1\s*=\s*1\b", "1=0"),
+        (r"(?i)'1'\s*=\s*'1'", "'1'='0'"),
+        (r'(?i)"1"\s*==\s*"1"', '"1"=="0"'),
+        (r"(?i)\bor\s+true\b", "OR false"),
+        (r"(?i)\band\s+true\b", "AND false"),
+        (r"(?i)\breturn\s+true\b", "RETURN false"),
+        (r"(?i)\balways\s+true\b", "always false"),
+        (r"\|\|\s*true", "||false"),
+        (r"&&\s*true", "&&false"),
+        (r"(?i)\bor1\s*=\s*1\b", "or1=0"),
+        (r"\"\$ne\"\s*:\s*\"([^\"]+)\"", r'"$eq":"\1"'),
+        (r"\"\$ne\"\s*:\s*([0-9]+)", r'"$eq":\1'),
+        (r"\"\$gt\"\s*:\s*([0-9]+)", r'"$lt":\1'),
+        (r"\"\$gte\"\s*:\s*([0-9]+)", r'"$lte":\1'),
+        (r"\"\$regex\"\s*:\s*\"[^\"]*\"", r'"$regex":"a^"'),
+        (r"\"\$exists\"\s*:\s*true", r'"$exists":false'),
+        (r"\"\$where\"\s*:\s*\"[^\"]*\"", r'"$where":"false"'),
+        (r"\$ne", "$eq"),
+        (r"\$gt", "$lt"),
+        (r"\$gte", "$lte"),
+    ]
+
+    for pattern, replacement in replacements:
+        transformed = re.sub(pattern, replacement, transformed)
+
+    if transformed == payload:
+        return None
+
+    return transformed
+
+
+def _count_boolean_intents(payloads: List[str], profile: EngineProfile) -> Tuple[int, int, int]:
+    true_count = 0
+    false_count = 0
+    neutral_count = 0
+
+    for payload in payloads:
+        intent = _infer_boolean_intent(payload, profile)
+        if intent == "true":
+            true_count += 1
+        elif intent == "false":
+            false_count += 1
+        else:
+            neutral_count += 1
+
+    return true_count, false_count, neutral_count
+
+
+def _analyze_boolean_pair(
+    baseline_samples: List[ResponseInfo],
+    true_response: ResponseInfo,
+    false_response: ResponseInfo,
+    profile: EngineProfile,
+) -> Tuple[bool, Optional[str]]:
+    if not baseline_samples:
+        return False, None
+
+    true_vs_baseline = _average([
+        _response_similarity(sample.body, true_response.body)
+        for sample in baseline_samples
+    ])
+    false_vs_baseline = _average([
+        _response_similarity(sample.body, false_response.body)
+        for sample in baseline_samples
+    ])
+    true_vs_false = _response_similarity(true_response.body, false_response.body)
+
+    true_struct_vs_baseline_values: List[float] = []
+    false_struct_vs_baseline_values: List[float] = []
+    for sample in baseline_samples:
+        true_struct = _json_structure_similarity(sample.body, true_response.body)
+        false_struct = _json_structure_similarity(sample.body, false_response.body)
+        if true_struct is not None:
+            true_struct_vs_baseline_values.append(true_struct)
+        if false_struct is not None:
+            false_struct_vs_baseline_values.append(false_struct)
+
+    true_struct_vs_baseline = _average(true_struct_vs_baseline_values)
+    false_struct_vs_baseline = _average(false_struct_vs_baseline_values)
+    struct_available = bool(true_struct_vs_baseline_values and false_struct_vs_baseline_values)
+
+    similarity_gap = true_vs_baseline - false_vs_baseline
+
+    strong_text_signal = (
+        true_vs_baseline >= profile.boolean_true_baseline_min_similarity
+        and false_vs_baseline <= profile.boolean_false_baseline_max_similarity
+        and true_vs_false <= profile.boolean_true_false_max_similarity
+        and similarity_gap >= profile.boolean_min_similarity_gap
+    )
+
+    strong_struct_signal = (
+        struct_available
+        and true_struct_vs_baseline >= profile.boolean_true_baseline_min_similarity
+        and false_struct_vs_baseline <= profile.boolean_false_baseline_max_similarity
+        and (true_struct_vs_baseline - false_struct_vs_baseline) >= profile.boolean_min_similarity_gap
+    )
+
+    if strong_text_signal or strong_struct_signal:
+        return (
+            True,
+            (
+                "Posible inyeccion NoSQL (boolean-based pareado: TRUE se parece al baseline "
+                f"({true_vs_baseline:.2f}) y FALSE diverge ({false_vs_baseline:.2f}))"
+            ),
+        )
+
+    return False, None
+
+
+def _looks_like_time_payload(payload: str, profile: EngineProfile) -> bool:
+    normalized = (payload or "").lower()
+    time_markers = profile.time_markers
+    return any(marker in normalized for marker in time_markers)
+
+
+def _extract_error_score(response: ResponseInfo, profile: EngineProfile) -> int:
     score = 0
 
     if response.status_code >= 500:
@@ -231,11 +426,11 @@ def _extract_error_score(response: ResponseInfo) -> int:
 
     text = (response.body or "").lower()
 
-    for keyword in ERROR_KEYWORDS:
+    for keyword in profile.error_keywords:
         if keyword in text:
             score += 2
 
-    for hint in ERROR_HINTS:
+    for hint in profile.error_hints:
         if hint in text:
             score += 1
 
@@ -253,13 +448,17 @@ def _extract_error_score(response: ResponseInfo) -> int:
     return score
 
 
-def _analyze_error_based(baseline: ResponseInfo, injected: ResponseInfo) -> Tuple[bool, Optional[str]]:
+def _analyze_error_based(
+    baseline: ResponseInfo,
+    injected: ResponseInfo,
+    profile: EngineProfile,
+) -> Tuple[bool, Optional[str]]:
     # Regla fuerte 1: error interno nuevo tras inyeccion.
     if baseline.status_code < 500 <= injected.status_code:
         return True, "Posible inyeccion NoSQL (error-based: 5xx nuevo en respuesta inyectada)"
 
-    base_score = _extract_error_score(baseline)
-    inj_score = _extract_error_score(injected)
+    base_score = _extract_error_score(baseline, profile)
+    inj_score = _extract_error_score(injected, profile)
     score_delta = inj_score - base_score
 
     # Regla fuerte 2: salto consistente de evidencia de error.
@@ -269,8 +468,8 @@ def _analyze_error_based(baseline: ResponseInfo, injected: ResponseInfo) -> Tupl
     # Regla fuerte 3: misma clase HTTP pero aparece texto de error de base de datos.
     base_text = (baseline.body or "").lower()
     inj_text = (injected.body or "").lower()
-    inj_has_db_error = any(k in inj_text for k in ERROR_KEYWORDS)
-    base_has_db_error = any(k in base_text for k in ERROR_KEYWORDS)
+    inj_has_db_error = any(k in inj_text for k in profile.error_keywords)
+    base_has_db_error = any(k in base_text for k in profile.error_keywords)
     if inj_has_db_error and not base_has_db_error:
         return True, "Posible inyeccion NoSQL (error-based: mensaje de error de motor/consulta)"
 
@@ -286,18 +485,23 @@ def _analyze_responses(
     injected: ResponseInfo,
     payload_source: str,
     payload: str,
+    profile: EngineProfile,
 ) -> Tuple[bool, Optional[str]]:
     source = (payload_source or "").lower()
 
     # Heuristica especifica: error-based
     if source == "error_based":
-        return _analyze_error_based(baseline, injected)
+        return _analyze_error_based(baseline, injected, profile)
 
     # Heuristica especifica: time-based
     if source == "time_based":
         if baseline.status_code != 0 and injected.status_code != 0:
             delta = injected.elapsed - baseline.elapsed
-            if delta >= max(TIME_BASED_MIN_DELAY_SECONDS, baseline.elapsed * TIME_BASED_MIN_FACTOR):
+            min_delay = max(profile.time_min_delay_seconds, baseline.elapsed * profile.time_min_factor)
+            if _looks_like_time_payload(payload, profile):
+                min_delay = max(0.5, baseline.elapsed * 1.5)
+
+            if delta >= min_delay:
                 return True, "Posible inyeccion NoSQL (time-based: incremento anomalo de latencia)"
 
     # Heuristica especifica: boolean-based
@@ -305,7 +509,7 @@ def _analyze_responses(
         base_len = len(baseline.body)
         inj_len = len(injected.body)
         diff_ratio = _relative_body_diff(base_len, inj_len)
-        intent = _infer_boolean_intent(payload)
+        intent = _infer_boolean_intent(payload, profile)
 
         if baseline.status_code != injected.status_code:
             return True, "Posible inyeccion NoSQL (boolean-based: cambio de codigo HTTP)"
@@ -316,7 +520,7 @@ def _analyze_responses(
         if intent == "false" and base_len > 0 and inj_len <= int(base_len * 0.8):
             return True, "Posible inyeccion NoSQL (boolean-based: condicion FALSE altera el resultado)"
 
-        if diff_ratio >= BOOLEAN_BASED_DIFF_RATIO:
+        if diff_ratio >= profile.boolean_diff_ratio:
             return True, "Posible inyeccion NoSQL (boolean-based: diferencia relevante en respuesta)"
 
     # Cambios importantes en longitud de respuesta
@@ -336,7 +540,7 @@ def _analyze_responses(
     return False, None
 
 
-def _run_single_test_case(base_url: str, test_case: TestCase) -> TestResult:
+def _run_single_test_case(base_url: str, test_case: TestCase, profile: EngineProfile) -> TestResult:
     # valores base genericos
     baseline_params = {name: "test" for name in test_case.endpoint.query_params}
     baseline_body = {name: "test" for name in test_case.endpoint.body_fields}
@@ -360,6 +564,7 @@ def _run_single_test_case(base_url: str, test_case: TestCase) -> TestResult:
         injected_resp,
         test_case.payload_source,
         test_case.payload,
+        profile,
     )
 
     return TestResult(
@@ -374,18 +579,78 @@ def _run_single_test_case(base_url: str, test_case: TestCase) -> TestResult:
     )
 
 
+def _run_boolean_pair_test_case(
+    base_url: str,
+    test_case: BooleanPairCase,
+    profile: EngineProfile,
+) -> TestResult:
+    baseline_params = {name: "test" for name in test_case.endpoint.query_params}
+    baseline_body = {name: "test" for name in test_case.endpoint.body_fields}
+
+    baseline_samples: List[ResponseInfo] = []
+    for _ in range(profile.boolean_baseline_samples):
+        baseline_samples.append(
+            _send_request(base_url, test_case.endpoint, baseline_params, baseline_body or None)
+        )
+
+    true_params = baseline_params.copy()
+    true_body = baseline_body.copy()
+    false_params = baseline_params.copy()
+    false_body = baseline_body.copy()
+
+    if test_case.param_location == "query":
+        true_params[test_case.param_name] = test_case.true_payload
+        false_params[test_case.param_name] = test_case.false_payload
+    else:
+        true_body[test_case.param_name] = test_case.true_payload
+        false_body[test_case.param_name] = test_case.false_payload
+
+    true_resp = _send_request(base_url, test_case.endpoint, true_params, true_body or None)
+    false_resp = _send_request(base_url, test_case.endpoint, false_params, false_body or None)
+
+    vulnerable, reason = _analyze_boolean_pair(baseline_samples, true_resp, false_resp, profile)
+
+    baseline_repr = _representative_response(baseline_samples)
+    pair_payload_label = f"TRUE: {test_case.true_payload} || FALSE: {test_case.false_payload}"
+
+    return TestResult(
+        endpoint=test_case.endpoint,
+        param_name=test_case.param_name,
+        payload=pair_payload_label,
+        payload_source=test_case.payload_source,
+        vulnerable=vulnerable,
+        reason=reason,
+        baseline=baseline_repr,
+        injected=true_resp,
+    )
+
+
 def _load_payloads_for_engine(engine: str, mode: str, payload_file: Optional[str] = None) -> List[str]:
-    url = resolve_payload_url(GITHUB_RAW_BASE, engine, mode, payload_file=payload_file)
+    canonical_engine = normalize_engine(engine)
+    urls = resolve_payload_urls(GITHUB_RAW_BASE, canonical_engine, mode, payload_file=payload_file)
 
     if payload_file:
         safe_name = payload_file.replace(".json", "").strip()
-        cache_file = f"{CACHE_DIR}/{engine}_{mode}_{safe_name}.json"
+        cache_file = f"{CACHE_DIR}/{canonical_engine}_{mode}_{safe_name}.json"
     else:
-        cache_file = f"{CACHE_DIR}/{engine}_{mode}.json"
+        cache_file = f"{CACHE_DIR}/{canonical_engine}_{mode}.json"
 
     etag_file = f"{cache_file}.etag"
 
-    download_if_updated(url, cache_file, etag_file, FETCH_TIMEOUT)
+    last_error: Optional[Exception] = None
+    downloaded = False
+    for url in urls:
+        try:
+            download_if_updated(url, cache_file, etag_file, FETCH_TIMEOUT)
+            downloaded = True
+            break
+        except Exception as ex:
+            last_error = ex
+
+    if not downloaded and not os.path.exists(cache_file):
+        raise RuntimeError(
+            f"No se pudieron descargar payloads para engine='{engine}' (probados: {', '.join(urls)})."
+        ) from last_error
 
     data = load_payloads(cache_file)
 
@@ -407,13 +672,14 @@ def _load_payload_sets(
     mode: str,
     payload_file: Optional[str] = None,
     detection_types: Optional[List[str]] = None,
+    default_detection_types: Optional[Tuple[str, ...]] = None,
 ) -> Dict[str, List[str]]:
     if payload_file:
         source = payload_file.replace(".json", "").strip()
         return {source: _load_payloads_for_engine(engine, mode, payload_file=payload_file)}
 
     if mode.lower() == "detection":
-        selected_types = detection_types or list(DEFAULT_DETECTION_TYPES)
+        selected_types = detection_types or list(default_detection_types or DEFAULT_DETECTION_TYPES)
         payload_sets: Dict[str, List[str]] = {}
 
         for detection_type in selected_types:
@@ -462,9 +728,47 @@ def build_test_cases(endpoints: List[Endpoint], payload_sets: Dict[str, List[str
     return cases
 
 
+def build_boolean_pair_cases(
+    endpoints: List[Endpoint],
+    payloads: List[str],
+    profile: EngineProfile,
+    payload_source: str = "boolean_based",
+) -> List[BooleanPairCase]:
+    pairs = _build_boolean_pairs(payloads, profile)
+    cases: List[BooleanPairCase] = []
+
+    for ep in endpoints:
+        for true_payload, false_payload in pairs:
+            for param in ep.query_params:
+                cases.append(
+                    BooleanPairCase(
+                        endpoint=ep,
+                        param_name=param,
+                        param_location="query",
+                        true_payload=true_payload,
+                        false_payload=false_payload,
+                        payload_source=payload_source,
+                    )
+                )
+
+            for field in ep.body_fields:
+                cases.append(
+                    BooleanPairCase(
+                        endpoint=ep,
+                        param_name=field,
+                        param_location="body",
+                        true_payload=true_payload,
+                        false_payload=false_payload,
+                        payload_source=payload_source,
+                    )
+                )
+
+    return cases
+
+
 def run_detection(
     swagger_path: str,
-    engine: str = "neo4j",
+    engine: Optional[str] = None,
     mode: str = "detection",
     payload_file: Optional[str] = None,
     detection_types: Optional[List[str]] = None,
@@ -475,7 +779,7 @@ def run_detection(
     """Ejecuta la deteccion de posibles inyecciones NoSQL.
 
     - swagger_path: ruta local al archivo swagger.json
-    - engine: motor NoSQL (mongo, couchdb, neo4j, ...)
+    - engine: motor NoSQL obligatorio (mongodb/mongo, couchdb, neo4j)
     - mode: tipo de payloads (detection / exploitation)
         - payload_file: nombre del json dentro de engine/mode (ej. "error_based" o "error_based.json")
             Si se indica, solo se usa ese archivo.
@@ -487,6 +791,10 @@ def run_detection(
       en lugar de la definida en el swagger (ej. "http://localhost:3000")
     """
 
+    if not engine or not engine.strip():
+        raise ValueError("Debe indicar el motor NoSQL en 'engine' (mongodb/mongo, couchdb o neo4j)")
+
+    profile = get_engine_profile(engine)
     spec = load_swagger_from_file(swagger_path)
     if base_url_override:
         base_url = base_url_override.rstrip("/")
@@ -498,24 +806,52 @@ def run_detection(
         raise ValueError("No se encontraron endpoints con parametros query/body para probar")
 
     payload_sets = _load_payload_sets(
-        engine,
+        profile.canonical_name,
         mode,
         payload_file=payload_file,
         detection_types=detection_types,
+        default_detection_types=profile.default_detection_types,
     )
 
     if not payload_sets or not any(payload_sets.values()):
         raise ValueError("No se cargaron payloads para el motor/modo especificados")
 
+    boolean_payloads = payload_sets.pop("boolean_based", None)
     test_cases = build_test_cases(endpoints, payload_sets)
+    boolean_pair_cases: List[BooleanPairCase] = []
+    if boolean_payloads:
+        boolean_pair_cases = build_boolean_pair_cases(
+            endpoints,
+            boolean_payloads,
+            profile=profile,
+            payload_source="boolean_based",
+        )
+
+        # Modo estricto para boolean-based: requiere pares TRUE/FALSE.
+        if not boolean_pair_cases:
+            true_count, false_count, neutral_count = _count_boolean_intents(boolean_payloads, profile)
+            raise ValueError(
+                "boolean_based requiere payloads pareados TRUE/FALSE. "
+                f"Detectados -> true: {true_count}, false: {false_count}, neutros: {neutral_count}."
+            )
+
+    if not test_cases and not boolean_pair_cases:
+        raise ValueError("No se generaron casos de prueba para los payloads seleccionados")
 
     results: List[TestResult] = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_case = {
-            executor.submit(_run_single_test_case, base_url, case): case
+            executor.submit(_run_single_test_case, base_url, case, profile): case
             for case in test_cases
         }
+
+        future_to_case.update(
+            {
+                executor.submit(_run_boolean_pair_test_case, base_url, case, profile): case
+                for case in boolean_pair_cases
+            }
+        )
 
         for future in as_completed(future_to_case):
             result = future.result()

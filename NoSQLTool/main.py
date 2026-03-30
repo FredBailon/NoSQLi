@@ -24,14 +24,17 @@ def main() -> None:
         swagger_path = os.path.join(swagger_dir, swagger_filename)
 
     base_url = os.getenv("BASE_URL", "http://localhost:3000")
-    engine = os.getenv("ENGINE", "neo4j")
+    engine = os.getenv("ENGINE")
     mode = os.getenv("MODE", "detection")
-    payload_file = os.getenv("PAYLOAD_FILE", "boolean_based") or None
+    payload_file = os.getenv("PAYLOAD_FILE") or None
 
     # target_path = "/ruta" para probar solo un endpoint concreto
     target_path = os.getenv("TARGET_PATH") or None
 
     print("Iniciando deteccion de posibles inyecciones NoSQL...")
+
+    if not engine:
+        raise ValueError("Debe definir la variable de entorno ENGINE (mongodb/mongo, couchdb o neo4j)")
 
     # Si usamos la carpeta temporal interna, la marcaremos para limpieza al final
     cleanup_file = None
