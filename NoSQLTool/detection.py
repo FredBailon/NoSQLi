@@ -349,7 +349,7 @@ def _run_single_test_case(base_url: str, test_case: TestCase, engine: str = "neo
             false_resp = _send_request(base_url, test_case.endpoint, false_params, false_body or None)
             neutral_resp = _send_request(base_url, test_case.endpoint, neutral_params, neutral_body or None)
             
-            # Análisis avanzado
+            # Análisis avanzado boolean-based (comparando TRUE vs FALSE)
             vulnerable, reason = strategy.analyze_boolean_based_advanced(
                 neutral_resp, true_resp, false_resp
             )
@@ -361,14 +361,13 @@ def _run_single_test_case(base_url: str, test_case: TestCase, engine: str = "neo
                     payload=test_case.payload,
                     payload_source=test_case.payload_source,
                     vulnerable=True,
-                    reason=reason,
+                    reason=f"[ADVANCED] {reason}",
                     baseline=neutral_resp,
                     injected=true_resp,
                 )
-        
-        # Fallback
-        if not vulnerable:
-            vulnerable, reason = strategy.analyze_boolean_based(baseline_resp, injected_resp, test_case.payload)
+        else:
+            # Si no hay par TRUE/FALSE dinámico, no se reporta ruido en consola.
+            pass
     
     elif test_case.payload_source == "error_based":
         vulnerable, reason = strategy.analyze_error_based(baseline_resp, injected_resp)

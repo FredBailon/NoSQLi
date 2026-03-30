@@ -7,6 +7,7 @@ __pycache__/
 .Python
 
 # Entornos virtuales
+.venv/
 venv/
 env/
 ENV/
@@ -41,6 +42,24 @@ MANIFEST
 *.tmp
 *.log
 *.pot
+
+# Testing, cobertura y caches de analisis
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Archivos locales de base de datos
+*.db
+*.sqlite
+*.sqlite3
 
 # Archivos del sistema
 .env
