@@ -175,10 +175,22 @@ class TimeBasedAnalyzer:
         if min_factor is None:
             min_factor = TimeBasedAnalyzer.MIN_FACTOR
 
-        if baseline.status_code != 0 and injected.status_code != 0:
-            delta = injected.elapsed - baseline.elapsed
-            if delta >= max(min_delay_seconds, baseline.elapsed * min_factor):
-                return True, f"Posible inyeccion time-based: delay {delta:.2f}s (baseline: {baseline.elapsed:.2f}s)"
+        delta = injected.elapsed - baseline.elapsed
+        threshold = max(min_delay_seconds, baseline.elapsed * min_factor)
+
+        # Si el delta supera el umbral, reportar incluso cuando la respuesta inyectada
+        # termine en timeout (status_code=0), ya que puede ser señal de sleep efectivo.
+        if delta >= threshold:
+            if injected.status_code == 0:
+                lower_body = (injected.body or "").lower()
+                timeout_hint = "timed out" in lower_body or "timeout" in lower_body
+                if timeout_hint:
+                    return True, (
+                        "Posible inyeccion time-based: timeout tras delay "
+                        f"{delta:.2f}s (baseline: {baseline.elapsed:.2f}s)"
+                    )
+
+            return True, f"Posible inyeccion time-based: delay {delta:.2f}s (baseline: {baseline.elapsed:.2f}s)"
 
         return False, None
 

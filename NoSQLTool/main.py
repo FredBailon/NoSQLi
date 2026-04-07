@@ -1,99 +1,81 @@
 import os
-import requests
-from .detection import run_detection, summarize_vulnerabilities
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+from .detection import TestResult, run_detection, summarize_vulnerabilities
 
 
-def _is_time_based_requested(mode: str, payload_file: str) -> bool:
-    if mode.lower() != "detection":
-        return False
+@dataclass
+class ScanConfig:
+    swagger_path: str
+    base_url: str
+    engine: str
+    mode: str = "detection"
+    payload_file: Optional[str] = None
+    target_path: Optional[str] = None
+    max_workers: int = 10
+    cleanup_file: Optional[str] = None
+    cleanup_dir: Optional[str] = None
 
-    if not payload_file:
-        # En detection sin payload_file especifico se ejecutan todos los tipos por defecto.
-        return True
 
-    return payload_file.replace(".json", "").strip().lower() == "time_based"
+@dataclass
+class ScanRunResult:
+    results: List[TestResult]
+    summary: Dict[str, Dict[str, List[str]]]
+    executed: bool
+    message: Optional[str] = None
 
 
-def _check_neo4j_apoc() -> tuple[bool, str]:
-    """Valida disponibilidad de APOC en Neo4j via endpoint HTTP transactional.
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        raise ValueError(f"Falta variable de entorno obligatoria: {name}")
+    return value.strip()
 
-    Variables de entorno utilizadas:
-    - NEO4J_HTTP_URL (default: http://host.docker.internal:7474)
-    - NEO4J_DATABASE (default: neo4j)
-    - NEO4J_USER (default: neo4j)
-    - NEO4J_PASSWORD (obligatoria para validar)
-    """
-    neo4j_http_url = os.getenv("NEO4J_HTTP_URL", "http://host.docker.internal:7474").rstrip("/")
-    neo4j_database = os.getenv("NEO4J_DATABASE", "neo4j")
-    neo4j_user = os.getenv("NEO4J_USER", "neo4j")
-    neo4j_password = os.getenv("NEO4J_PASSWORD")
 
-    if not neo4j_password:
-        return False, (
-            "No se pudo validar APOC: falta NEO4J_PASSWORD para consultar Neo4j. "
-            "Se omite deteccion time_based para evitar resultados no confiables."
-        )
-
-    url = f"{neo4j_http_url}/db/{neo4j_database}/tx/commit"
-    payload = {
-        "statements": [
-            {"statement": "RETURN apoc.version() AS version"}
-        ]
-    }
-
+def run_scan(config: ScanConfig) -> ScanRunResult:
     try:
-        response = requests.post(
-            url,
-            json=payload,
-            auth=(neo4j_user, neo4j_password),
-            timeout=5,
-        )
-    except requests.RequestException as exc:
-        return False, (
-            "No se pudo validar APOC por error de conexion a Neo4j: "
-            f"{exc}. Se omite deteccion time_based."
+        results = run_detection(
+            swagger_path=config.swagger_path,
+            engine=config.engine,
+            mode=config.mode,
+            payload_file=config.payload_file,
+            target_path=config.target_path,
+            max_workers=config.max_workers,
+            base_url_override=config.base_url,
         )
 
-    if response.status_code != 200:
-        return False, (
-            "No se pudo validar APOC: Neo4j respondio con "
-            f"HTTP {response.status_code}. Se omite deteccion time_based."
-        )
+        summary = summarize_vulnerabilities(results)
+        return ScanRunResult(results=results, summary=summary, executed=True, message=None)
+    finally:
+        if config.cleanup_file and os.path.exists(config.cleanup_file):
+            try:
+                os.remove(config.cleanup_file)
+            except OSError:
+                pass
 
-    try:
-        data = response.json()
-    except ValueError:
-        return False, "No se pudo validar APOC: respuesta no JSON de Neo4j. Se omite deteccion time_based."
-
-    errors = data.get("errors") or []
-    if errors:
-        details = " | ".join(str(e.get("message", "")) for e in errors)
-        lower_details = details.lower()
-
-        if "unknown function" in lower_details or "apoc" in lower_details:
-            return False, "APOC no esta instalado o no esta habilitado en Neo4j. Se omite deteccion time_based."
-
-        return False, f"No se pudo validar APOC: {details}. Se omite deteccion time_based."
-
-    results = data.get("results") or []
-    if results and isinstance(results[0], dict):
-        rows = results[0].get("data") or []
-        if rows:
-            return True, "APOC validado correctamente en Neo4j."
-
-    return False, "No se pudo confirmar version de APOC en Neo4j. Se omite deteccion time_based."
+        if config.cleanup_dir and os.path.isdir(config.cleanup_dir):
+            try:
+                os.rmdir(config.cleanup_dir)
+            except OSError:
+                pass
 
 
 def main() -> None:
-    # Directorio temporal dentro del contenedor para subir el swagger.json
-    # Por defecto: /tmp/swagger, pero puede cambiarse con SWAGGER_DIR
+    # SWAGGER_PATH directo o combinacion SWAGGER_DIR + SWAGGER_FILENAME.
+    # Estas variables deben venir configuradas desde el CLI o el entorno.
     swagger_path_env = os.getenv("SWAGGER_PATH")
-    swagger_dir = os.getenv("SWAGGER_DIR", "/tmp/swagger")
-    swagger_filename = os.getenv("SWAGGER_FILENAME", "swagger.json")
+    swagger_dir = os.getenv("SWAGGER_DIR")
+    swagger_filename = os.getenv("SWAGGER_FILENAME")
 
     if swagger_path_env:
         swagger_path = swagger_path_env
     else:
+        if not swagger_dir or not swagger_filename:
+            raise ValueError(
+                "Debe definir SWAGGER_PATH o ambas SWAGGER_DIR y SWAGGER_FILENAME."
+            )
+
         # Creamos el directorio si no existe y restringimos permisos
         os.makedirs(swagger_dir, exist_ok=True)
         try:
@@ -105,19 +87,13 @@ def main() -> None:
 
         swagger_path = os.path.join(swagger_dir, swagger_filename)
 
-    base_url = os.getenv("BASE_URL", "http://localhost:3000")
-    engine = os.getenv("ENGINE", "neo4j")
-    mode = os.getenv("MODE", "detection")
-    payload_file = os.getenv("PAYLOAD_FILE", "boolean_based") or None
+    base_url = _required_env("BASE_URL")
+    engine = _required_env("ENGINE")
+    mode = _required_env("MODE")
+    payload_file = os.getenv("PAYLOAD_FILE") or None
 
     # target_path = "/ruta" para probar solo un endpoint concreto
     target_path = os.getenv("TARGET_PATH") or None
-
-    if "neo4j" in engine.lower() and _is_time_based_requested(mode, payload_file):
-        apoc_ok, apoc_message = _check_neo4j_apoc()
-        print(apoc_message)
-        if not apoc_ok:
-            return
 
     # Si usamos la carpeta temporal interna, la marcaremos para limpieza al final
     cleanup_file = None
@@ -126,44 +102,37 @@ def main() -> None:
         cleanup_file = swagger_path
         cleanup_dir = swagger_dir
 
-    try:
-        results = run_detection(
+    run_result = run_scan(
+        ScanConfig(
             swagger_path=swagger_path,
+            base_url=base_url,
             engine=engine,
             mode=mode,
             payload_file=payload_file,
             target_path=target_path,
-            max_workers=10,
-            base_url_override=base_url,
+            max_workers=int(os.getenv("MAX_WORKERS", "10")),
+            cleanup_file=cleanup_file,
+            cleanup_dir=cleanup_dir,
         )
+    )
 
-        summary = summarize_vulnerabilities(results)
+    if run_result.message:
+        print(run_result.message)
 
-        if not summary:
-            return
+    if not run_result.executed:
+        return
 
-        print("\nResumen de posibles endpoints vulnerables:\n")
-        for endpoint_key, params in summary.items():
-            print(f"[+] Endpoint: {endpoint_key}")
-            for param_name, payloads in params.items():
-                print(f"    Parametro vulnerable: {param_name}")
-                print("    Payloads que provocaron comportamiento sospechoso:")
-                for p in payloads:
-                    print(f"        - {p}")
-    finally:
-        # Eliminamos el archivo swagger y la carpeta temporal (si se crearon internamente)
-        if cleanup_file and os.path.exists(cleanup_file):
-            try:
-                os.remove(cleanup_file)
-            except OSError:
-                pass
+    if not run_result.summary:
+        return
 
-        if cleanup_dir and os.path.isdir(cleanup_dir):
-            try:
-                os.rmdir(cleanup_dir)
-            except OSError:
-                # Si la carpeta no esta vacia o es un volumen, no la forzamos
-                pass
+    print("\nResumen de posibles endpoints vulnerables:\n")
+    for endpoint_key, params in run_result.summary.items():
+        print(f"[+] Endpoint: {endpoint_key}")
+        for param_name, payloads in params.items():
+            print(f"    Parametro vulnerable: {param_name}")
+            print("    Payloads que provocaron comportamiento sospechoso:")
+            for p in payloads:
+                print(f"        - {p}")
 
 
 if __name__ == "__main__":

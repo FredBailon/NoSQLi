@@ -42,6 +42,8 @@ MANIFEST
 *.tmp
 *.log
 *.pot
+*.pid
+*.seed
 
 # Testing, cobertura y caches de analisis
 .pytest_cache/
@@ -65,3 +67,20 @@ htmlcov/
 .env
 .env.local
 *.bak
+
+# Reportes y salidas generadas por la herramienta
+reports/
+/tmp/reports/
+nosql_report_*.json
+nosql_report_*.txt
+
+# Swagger local de pruebas (cuando se monta desde host)
+swagger/
+
+# Artefactos de Docker / contenedores locales
+.docker/
+docker-data/
+
+# Salidas de herramientas comunes en Windows
+Thumbs.db
+Desktop.ini

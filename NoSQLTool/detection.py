@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 from .config import (
-    GITHUB_RAW_BASE, CACHE_DIR, FETCH_TIMEOUT,
+    GITHUB_RAW_BASE, CACHE_DIR, FETCH_TIMEOUT, REQUEST_TIMEOUT,
 )
 from .payloads.resolver import resolve_payload_url
 from .payloads.cache import download_if_updated
@@ -195,7 +195,7 @@ def _send_request(
             url,
             params=params,
             json=json_body,
-            timeout=FETCH_TIMEOUT,
+            timeout=REQUEST_TIMEOUT,
         )
         elapsed = time.time() - start
         return ResponseInfo(status_code=resp.status_code, body=resp.text or "", elapsed=elapsed)
