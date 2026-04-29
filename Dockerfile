@@ -10,12 +10,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY NoSQLTool ./NoSQLTool
 
 # Crear carpeta temporal para subir swagger.json con permisos restringidos
-RUN mkdir -p /tmp/swagger \
-    && chmod 700 /tmp/swagger
+RUN mkdir -p /tmp/swagger /tmp/reports \
+    && chmod 700 /tmp/swagger \
+    && chmod 755 /tmp/reports
 
 ENV PYTHONUNBUFFERED=1 \
     SWAGGER_DIR=/tmp/swagger \
-    SWAGGER_FILENAME=swagger.json
+    SWAGGER_FILENAME=swagger.json \
+    REPORTS_DIR=/tmp/reports \
+    FLASK_HOST=0.0.0.0 \
+    FLASK_PORT=5000
 
-# Comando por defecto: ejecutar el main del paquete
-CMD ["python", "-m", "NoSQLTool.main"]
+# Modo por defecto: CLI interactivo
+# Para servidor de reportes: docker run -p 5000:5000 nosqltool python -m NoSQLTool --server
+CMD ["python", "-m", "NoSQLTool"]
