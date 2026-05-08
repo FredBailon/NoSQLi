@@ -42,6 +42,7 @@ class TestCase:
 class TestResult:
     endpoint: Endpoint
     param_name: str
+    param_location: str
     payload: str
     payload_source: str
     vulnerable: bool
@@ -358,6 +359,7 @@ def _run_single_test_case(base_url: str, test_case: TestCase, engine: str = "neo
                 return TestResult(
                     endpoint=test_case.endpoint,
                     param_name=test_case.param_name,
+                    param_location=test_case.param_location,
                     payload=test_case.payload,
                     payload_source=test_case.payload_source,
                     vulnerable=True,
@@ -384,6 +386,7 @@ def _run_single_test_case(base_url: str, test_case: TestCase, engine: str = "neo
     return TestResult(
         endpoint=test_case.endpoint,
         param_name=test_case.param_name,
+        param_location=test_case.param_location,
         payload=test_case.payload,
         payload_source=test_case.payload_source,
         vulnerable=vulnerable,
