@@ -136,6 +136,60 @@ def _print_summary(summary: Dict[str, Dict[str, List[str]]]) -> None:
                 print(f"      - {payload}")
 
 
+def _build_flag_based_report(
+    last_results: List[TestResult],
+    last_summary: Dict[str, Dict[str, List[str]]],
+) -> Dict[str, object]:
+    """Construye un reporte basado en banderas (flags).
+    
+    Agrupa endpoints vulnerables por tipo de detección, mostrando de forma
+    simplificada qué endpoints son vulnerables a qué tipo de ataque.
+    """
+    # Estructura: endpoint -> set de tipos de detección vulnerables
+    vulnerable_endpoints: Dict[str, Dict[str, object]] = {}
+    
+    # Procesar resultados vulnerables
+    for result in last_results:
+        if not result.vulnerable:
+            continue
+            
+        endpoint_key = f"{result.endpoint.method} {result.endpoint.path}"
+        
+        if endpoint_key not in vulnerable_endpoints:
+            vulnerable_endpoints[endpoint_key] = {
+                "endpoint": endpoint_key,
+                "vulnerabilities": set(),
+                "vulnerable_parameters": {}
+            }
+        
+        # Agregar tipo de detección
+        vuln_entry = vulnerable_endpoints[endpoint_key]
+        vuln_entry["vulnerabilities"].add(result.payload_source)
+        
+        # Rastrear parámetros por tipo de detección
+        if result.param_name not in vuln_entry["vulnerable_parameters"]:
+            vuln_entry["vulnerable_parameters"][result.param_name] = set()
+        vuln_entry["vulnerable_parameters"][result.param_name].add(result.payload_source)
+    
+    # Convertir sets a listas ordenadas para JSON
+    flag_report = {
+        "vulnerable_endpoints": []
+    }
+    
+    for endpoint_key in sorted(vulnerable_endpoints.keys()):
+        entry = vulnerable_endpoints[endpoint_key]
+        flag_report["vulnerable_endpoints"].append({
+            "endpoint": entry["endpoint"],
+            "vulnerabilities": sorted(list(entry["vulnerabilities"])),
+            "vulnerable_parameters": {
+                param: sorted(list(detections))
+                for param, detections in entry["vulnerable_parameters"].items()
+            }
+        })
+    
+    return flag_report
+
+
 def _run_detection_flow() -> Tuple[Optional[List[TestResult]], Optional[Dict[str, Dict[str, List[str]]]], Optional[dict]]:
     _clear_screen()
     print("=== Modulo de Deteccion NoSQL ===")
@@ -217,6 +271,11 @@ def _generate_report_flow(
         print("Ejecuta primero una deteccion para poder generar el reporte.")
         return
 
+    print("\nTipo de reporte")
+    print("  1) Reporte detallado (JSON/TXT)")
+    print("  2) Reporte por banderas (Flags)")
+    report_type = _prompt_choice("Selecciona tipo [1-2]: ", {"1": "detailed", "2": "flags"})
+
     print("\nFormato de reporte")
     print("  1) JSON")
     print("  2) TXT")
@@ -227,54 +286,97 @@ def _generate_report_flow(
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    if format_choice == "1":
-        report_path = report_dir / f"nosql_report_{timestamp}.json"
-        report_payload = {
-            "metadata": last_metadata,
-            "summary": last_summary,
-            "vulnerable_cases": [
-                {
-                    "endpoint": f"{r.endpoint.method} {r.endpoint.path}",
-                    "parameter": r.param_name,
-                    "payload": r.payload,
-                    "payload_source": r.payload_source,
-                    "reason": r.reason,
-                    "status_baseline": r.baseline.status_code,
-                    "status_injected": r.injected.status_code,
-                    "elapsed_baseline": r.baseline.elapsed,
-                    "elapsed_injected": r.injected.elapsed,
-                }
-                for r in last_results
-                if r.vulnerable
-            ],
-        }
-        report_path.write_text(json.dumps(report_payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    else:
-        report_path = report_dir / f"nosql_report_{timestamp}.txt"
-        lines: List[str] = []
-        lines.append("REPORTE DE DETECCION NOSQL")
-        lines.append("=" * 32)
-        lines.append("")
-        lines.append(f"Fecha: {last_metadata['executed_at']}")
-        lines.append(f"Motor: {last_metadata['engine_label']}")
-        lines.append(f"API: {last_metadata['base_url']}")
-        lines.append(f"Swagger: {last_metadata['swagger_path']}")
-        lines.append(f"Tipo de deteccion: {last_metadata['detection_type']}")
-        lines.append(f"Total de casos evaluados: {last_metadata['total_tests']}")
-        lines.append("")
-
-        if not last_summary:
-            lines.append("No se detectaron hallazgos vulnerables.")
+    # ====== REPORTE DETALLADO ======
+    if report_type == "detailed":
+        if format_choice == "1":
+            report_path = report_dir / f"nosql_report_detailed_{timestamp}.json"
+            report_payload = {
+                "metadata": last_metadata,
+                "summary": last_summary,
+                "vulnerable_cases": [
+                    {
+                        "endpoint": f"{r.endpoint.method} {r.endpoint.path}",
+                        "parameter": r.param_name,
+                        "payload": r.payload,
+                        "payload_source": r.payload_source,
+                        "reason": r.reason,
+                        "status_baseline": r.baseline.status_code,
+                        "status_injected": r.injected.status_code,
+                        "elapsed_baseline": r.baseline.elapsed,
+                        "elapsed_injected": r.injected.elapsed,
+                    }
+                    for r in last_results
+                    if r.vulnerable
+                ],
+            }
+            report_path.write_text(json.dumps(report_payload, indent=2, ensure_ascii=False), encoding="utf-8")
         else:
-            lines.append("Hallazgos:")
-            for endpoint_key, params in last_summary.items():
-                lines.append(f"- Endpoint: {endpoint_key}")
-                for param_name, payloads in params.items():
-                    lines.append(f"  Parametro: {param_name}")
-                    for payload in payloads:
-                        lines.append(f"    * {payload}")
+            report_path = report_dir / f"nosql_report_detailed_{timestamp}.txt"
+            lines: List[str] = []
+            lines.append("REPORTE DE DETECCION NOSQL - FORMATO DETALLADO")
+            lines.append("=" * 50)
+            lines.append("")
+            lines.append(f"Fecha: {last_metadata['executed_at']}")
+            lines.append(f"Motor: {last_metadata['engine_label']}")
+            lines.append(f"API: {last_metadata['base_url']}")
+            lines.append(f"Swagger: {last_metadata['swagger_path']}")
+            lines.append(f"Tipo de deteccion: {last_metadata['detection_type']}")
+            lines.append(f"Total de casos evaluados: {last_metadata['total_tests']}")
+            lines.append("")
 
-        report_path.write_text("\n".join(lines), encoding="utf-8")
+            if not last_summary:
+                lines.append("No se detectaron hallazgos vulnerables.")
+            else:
+                lines.append("Hallazgos:")
+                for endpoint_key, params in last_summary.items():
+                    lines.append(f"- Endpoint: {endpoint_key}")
+                    for param_name, payloads in params.items():
+                        lines.append(f"  Parametro: {param_name}")
+                        for payload in payloads:
+                            lines.append(f"    * {payload}")
+
+            report_path.write_text("\n".join(lines), encoding="utf-8")
+    
+    # ====== REPORTE POR BANDERAS ======
+    else:  # report_type == "flags"
+        flag_report = _build_flag_based_report(last_results, last_summary)
+        
+        if format_choice == "1":
+            report_path = report_dir / f"nosql_report_flags_{timestamp}.json"
+            report_payload = {
+                "metadata": last_metadata,
+                "flags_report": flag_report
+            }
+            report_path.write_text(json.dumps(report_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        else:
+            report_path = report_dir / f"nosql_report_flags_{timestamp}.txt"
+            lines: List[str] = []
+            lines.append("REPORTE DE DETECCION NOSQL - BANDERAS (FLAGS)")
+            lines.append("=" * 50)
+            lines.append("")
+            lines.append(f"Fecha: {last_metadata['executed_at']}")
+            lines.append(f"Motor: {last_metadata['engine_label']}")
+            lines.append(f"API: {last_metadata['base_url']}")
+            lines.append(f"Tipo de deteccion: {last_metadata['detection_type']}")
+            lines.append("")
+
+            if not flag_report["vulnerable_endpoints"]:
+                lines.append("No se detectaron endpoints vulnerables.")
+            else:
+                lines.append(f"Total endpoints vulnerables: {len(flag_report['vulnerable_endpoints'])}")
+                lines.append("")
+                
+                for endpoint_entry in flag_report["vulnerable_endpoints"]:
+                    lines.append(f"[*] {endpoint_entry['endpoint']}")
+                    lines.append(f"    Vulnerable a: {', '.join(endpoint_entry['vulnerabilities'])}")
+                    
+                    if endpoint_entry['vulnerable_parameters']:
+                        lines.append("    Parámetros afectados:")
+                        for param, vuln_types in endpoint_entry['vulnerable_parameters'].items():
+                            lines.append(f"      - {param}: {', '.join(vuln_types)}")
+                    lines.append("")
+
+            report_path.write_text("\n".join(lines), encoding="utf-8")
 
     print(f"\nReporte generado en: {report_path}")
 
