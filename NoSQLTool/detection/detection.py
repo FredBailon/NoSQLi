@@ -6,12 +6,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-from .config import (
+from ..config import (
     GITHUB_RAW_BASE, CACHE_DIR, FETCH_TIMEOUT, REQUEST_TIMEOUT,
 )
-from .payloads.resolver import resolve_payload_url
-from .payloads.cache import download_if_updated
-from .payloads.loader import load_payloads
+from ..payloads.resolver import resolve_payload_url
+from ..payloads.cache import download_if_updated
+from ..payloads.loader import load_payloads
 from .engines import get_engine_strategy
 from .base_analysis import ResponseInfo as BaseResponseInfo
 
@@ -159,28 +159,6 @@ def extract_endpoints(spec: Dict[str, Any], target_path: Optional[str] = None) -
     return endpoints
 
 
-def _get_engine_strategy(engine: str):
-    """Obtiene la estrategia especializada para un motor NoSQL.
-    
-    Soporta importación dinámica de estrategias especializadas como CouchDB.
-    
-    Args:
-        engine: Nombre del motor NoSQL
-        
-    Returns:
-        Instancia de NoSQLEngineStrategy
-    """
-    engine_lower = engine.lower()
-    
-    # Importación dinámica de CouchDB si es necesario
-    if "couchdb" in engine_lower or "couch" in engine_lower:
-        from .couchdb_detection import CouchDBStrategy
-        return CouchDBStrategy()
-    
-    # Para otros motores, usar la función estándar
-    return get_engine_strategy(engine)
-
-
 def _send_request(
     base_url: str,
     endpoint: Endpoint,
@@ -297,7 +275,7 @@ def _run_single_test_case(base_url: str, test_case: TestCase, engine: str = "neo
     
     Delega el análisis a la estrategia especializada del motor.
     """
-    strategy = _get_engine_strategy(engine)
+    strategy = get_engine_strategy(engine)
     
     # Valores base genéricos
     baseline_params = {name: "test" for name in test_case.endpoint.query_params}

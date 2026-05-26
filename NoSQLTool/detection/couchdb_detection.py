@@ -8,7 +8,7 @@ import json
 from typing import Any, Optional, Tuple
 
 from .engines import NoSQLEngineStrategy
-from .base_analysis import ResponseInfo
+from .detection import ResponseInfo
 
 # Palabras clave y pistas específicas para errores de CouchDB
 COUCHDB_ERROR_KEYWORDS = (
