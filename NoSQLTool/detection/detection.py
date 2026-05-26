@@ -13,7 +13,7 @@ from ..payloads.resolver import resolve_payload_url
 from ..payloads.cache import download_if_updated
 from ..payloads.loader import load_payloads
 from .engines import get_engine_strategy
-from .detection.base_analysis import ResponseInfo as BaseResponseInfo
+from .base_analysis import ResponseInfo as BaseResponseInfo
 
 # Re-export ResponseInfo para compatibilidad
 ResponseInfo = BaseResponseInfo

@@ -435,6 +435,7 @@ def _generate_exploitation_report(
                         "attempts": r.metrics.attempts,
                         "elapsed_time": round(r.metrics.elapsed_time, 2),
                         "extracted_fields": r.metrics.extracted_fields,
+                        "warnings": r.metrics.warnings,
                     },
                     "evidence": [
                         {
@@ -497,6 +498,10 @@ def _generate_exploitation_report(
             lines.append(f"  • Datos extraídos: {expl_result.metrics.data_length} caracteres")
             lines.append(f"  • Intentos realizados: {expl_result.metrics.attempts}")
             lines.append(f"  • Tiempo total: {expl_result.metrics.elapsed_time:.2f} segundos")
+            if expl_result.metrics.warnings:
+                lines.append("  • Advertencias:")
+                for warning in expl_result.metrics.warnings:
+                    lines.append(f"    - {warning}")
             lines.append("")
             
             # Evidencia detallada
