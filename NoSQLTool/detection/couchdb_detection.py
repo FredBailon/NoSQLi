@@ -5,6 +5,7 @@ en CouchDB usando el lenguaje Mango Query con análisis especializados.
 """
 
 import json
+import copy
 from typing import Any, Optional, Tuple
 
 from .engines import NoSQLEngineStrategy
@@ -13,8 +14,12 @@ from .detection import ResponseInfo
 # Palabras clave y pistas específicas para errores de CouchDB
 COUCHDB_ERROR_KEYWORDS = (
     "couchdb",
+    "mango",
+    "selector",
     "bad_request",
     "invalid_json",
+    "invalid_operator",
+    "no_usable_index",
     "badmatch",
     "not_found",
     "file_not_found",
@@ -33,6 +38,9 @@ COUCHDB_ERROR_HINTS = (
     "missing",
     "docid",
     "database_error",
+    "execution_stats",
+    "use_index",
+    "allow_fallback",
 )
 
 
@@ -42,6 +50,9 @@ class CouchDBStrategy(NoSQLEngineStrategy):
     CouchDB utiliza Mango Query Language con operadores específicos.
     Esta implementación proporciona análisis adaptados a CouchDB.
     """
+
+    def supports_body_raw_payloads(self) -> bool:
+        return True
 
     def generate_boolean_pair(self, payload: str) -> Tuple[Optional[str], Optional[str]]:
         """Genera variantes TRUE y FALSE para CouchDB (Mango).
@@ -57,26 +68,10 @@ class CouchDBStrategy(NoSQLEngineStrategy):
         """
         try:
             payload_dict = json.loads(payload)
-
-            true_variant = payload_dict.copy()
-            false_variant = payload_dict.copy()
-
-            # Intercambiar operadores $eq ↔ $ne y comparadores
-            for key, value in payload_dict.items():
-                if isinstance(value, dict):
-                    if "$eq" in value:
-                        false_variant[key] = {"$ne": value["$eq"]}
-                    elif "$ne" in value:
-                        true_variant[key] = {"$eq": value["$ne"]}
-                    elif "$gt" in value:
-                        false_variant[key] = {"$lte": value["$gt"]}
-                    elif "$lt" in value:
-                        false_variant[key] = {"$gte": value["$lt"]}
-                    elif "$regex" in value:
-                        # Para regex, usar patrones que siempre/nunca coinciden
-                        true_variant[key] = {"$regex": ".*"}
-                        false_variant[key] = {"$regex": "(?!.*)"}
-
+            true_variant = self._boolean_variant(payload_dict, True)
+            false_variant = self._boolean_variant(payload_dict, False)
+            if true_variant == false_variant:
+                return (None, None)
             return (json.dumps(true_variant), json.dumps(false_variant))
         except (json.JSONDecodeError, TypeError):
             return (None, None)
@@ -137,6 +132,39 @@ class CouchDBStrategy(NoSQLEngineStrategy):
 
         return False, None
 
+    def analyze_time_based(self, baseline: ResponseInfo, injected: ResponseInfo) -> Tuple[bool, Optional[str]]:
+        """Analiza señales de degradación Mango por tiempo HTTP y execution_stats."""
+        vulnerable, reason = super().analyze_time_based(baseline, injected)
+        if vulnerable:
+            return vulnerable, reason
+
+        baseline_stats = self._extract_execution_stats(baseline.body)
+        injected_stats = self._extract_execution_stats(injected.body)
+
+        if not baseline_stats or not injected_stats:
+            return False, None
+
+        base_time = baseline_stats.get("execution_time_ms")
+        injected_time = injected_stats.get("execution_time_ms")
+        if base_time is not None and injected_time is not None:
+            delta = injected_time - base_time
+            threshold = max(50.0, base_time * 2.0)
+            if delta >= threshold:
+                return True, (
+                    "time-based: execution_stats indica degradacion "
+                    f"({base_time:.2f}ms -> {injected_time:.2f}ms)"
+                )
+
+        docs_delta = self._stat_delta(baseline_stats, injected_stats, "total_docs_examined")
+        keys_delta = self._stat_delta(baseline_stats, injected_stats, "total_keys_examined")
+        if docs_delta >= 100 or keys_delta >= 100:
+            return True, (
+                "time-based: execution_stats indica mayor trabajo de consulta "
+                f"(docs +{docs_delta:.0f}, keys +{keys_delta:.0f})"
+            )
+
+        return False, None
+
     @staticmethod
     def _neutral_variant(obj: Any) -> Optional[Any]:
         """Elimina condiciones booleanas en CouchDB.
@@ -156,12 +184,87 @@ class CouchDBStrategy(NoSQLEngineStrategy):
             for key, value in obj.items():
                 if isinstance(value, dict):
                     # Omitir selectores con operadores de comparación
-                    comparison_operators = ("$eq", "$ne", "$gt", "$lt", "$regex", "$gte", "$lte")
+                    comparison_operators = (
+                        "$eq",
+                        "$ne",
+                        "$gt",
+                        "$lt",
+                        "$regex",
+                        "$gte",
+                        "$lte",
+                        "$exists",
+                        "$in",
+                        "$nin",
+                        "$not",
+                    )
                     if not any(op in value for op in comparison_operators):
-                        result[key] = value
+                        nested = CouchDBStrategy._neutral_variant(value)
+                        result[key] = nested if nested is not None else value
                 else:
                     result[key] = value
 
             return result if result else None
 
         return None
+
+    @staticmethod
+    def _boolean_variant(obj: Any, is_true: bool) -> Any:
+        """Reescribe recursivamente operadores Mango para crear TRUE/FALSE."""
+        if not isinstance(obj, dict):
+            return copy.deepcopy(obj)
+
+        if "$eq" in obj:
+            value = obj["$eq"]
+            return {"$eq" if is_true else "$ne": value}
+        if "$ne" in obj:
+            value = obj["$ne"]
+            return {"$ne" if is_true else "$eq": value}
+        if "$gt" in obj:
+            value = obj["$gt"]
+            return {"$gt" if is_true else "$lte": value}
+        if "$lt" in obj:
+            value = obj["$lt"]
+            return {"$lt" if is_true else "$gte": value}
+        if "$gte" in obj:
+            value = obj["$gte"]
+            return {"$gte" if is_true else "$lt": value}
+        if "$lte" in obj:
+            value = obj["$lte"]
+            return {"$lte" if is_true else "$gt": value}
+        if "$regex" in obj:
+            return {"$regex": ".*" if is_true else "(?!.*)"}
+        if "$exists" in obj:
+            return {"$exists": bool(obj["$exists"]) if is_true else not bool(obj["$exists"])}
+
+        return {
+            key: CouchDBStrategy._boolean_variant(value, is_true)
+            for key, value in obj.items()
+        }
+
+    @staticmethod
+    def _extract_execution_stats(body: str) -> Optional[dict]:
+        try:
+            parsed = json.loads(body)
+        except (TypeError, ValueError):
+            return None
+
+        if not isinstance(parsed, dict):
+            return None
+
+        stats = parsed.get("execution_stats")
+        if isinstance(stats, dict):
+            return {
+                key: float(value)
+                for key, value in stats.items()
+                if isinstance(value, (int, float))
+            }
+
+        return None
+
+    @staticmethod
+    def _stat_delta(baseline_stats: dict, injected_stats: dict, key: str) -> float:
+        baseline_value = baseline_stats.get(key)
+        injected_value = injected_stats.get(key)
+        if baseline_value is None or injected_value is None:
+            return 0.0
+        return max(0.0, injected_value - baseline_value)

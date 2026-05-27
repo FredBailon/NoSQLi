@@ -28,7 +28,7 @@ def download_if_updated(url, cache_file, etag_file, timeout, force_revalidate=Fa
         return False
 
     if response.status_code != 200:
-        raise RuntimeError(f"Error HTTP {response.status_code}")
+        raise RuntimeError(f"Error HTTP {response.status_code} al descargar payloads desde {url}")
 
     with open(cache_file, "w", encoding="utf-8") as f:
         f.write(response.text)

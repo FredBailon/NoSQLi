@@ -1,4 +1,5 @@
 import json
+import copy
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -34,7 +35,7 @@ class TestCase:
     endpoint: Endpoint
     param_name: str
     payload: str
-    param_location: str  # "query" o "body"
+    param_location: str  # "query", "body" o "body_raw"
     payload_source: str
 
 
@@ -78,7 +79,21 @@ def _build_base_url(spec: Dict[str, Any]) -> str:
     raise ValueError("No se pudo determinar la URL base de la API desde el swagger.json")
 
 
-def _extract_body_fields_from_schema(schema: Dict[str, Any]) -> List[str]:
+def _resolve_schema_ref(spec: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
+    ref = schema.get("$ref")
+    if not isinstance(ref, str) or not ref.startswith("#/"):
+        return schema
+
+    current: Any = spec
+    for part in ref.lstrip("#/").split("/"):
+        if not isinstance(current, dict) or part not in current:
+            return schema
+        current = current[part]
+
+    return current if isinstance(current, dict) else schema
+
+
+def _extract_body_fields_from_schema(schema: Dict[str, Any], spec: Optional[Dict[str, Any]] = None) -> List[str]:
     """Extrae nombres de campos de primer nivel del cuerpo JSON.
 
     Se centra en esquemas tipo object y propiedades simples (string, number, etc.).
@@ -88,12 +103,35 @@ def _extract_body_fields_from_schema(schema: Dict[str, Any]) -> List[str]:
     if not isinstance(schema, dict):
         return fields
 
+    if spec:
+        schema = _resolve_schema_ref(spec, schema)
+
+    if isinstance(schema.get("allOf"), list) or isinstance(schema.get("oneOf"), list) or isinstance(schema.get("anyOf"), list):
+        for key in ("allOf", "oneOf", "anyOf"):
+            for child in schema.get(key, []) or []:
+                if isinstance(child, dict):
+                    fields.extend(_extract_body_fields_from_schema(child, spec))
+        return list(dict.fromkeys(fields))
+
     if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
         for name, prop in schema["properties"].items():
             if not isinstance(prop, dict):
                 continue
+            if spec:
+                prop = _resolve_schema_ref(spec, prop)
             prop_type = prop.get("type")
-            if prop_type in {"string", "number", "integer", "boolean", None}:
+            has_supported_variant = False
+            for key in ("oneOf", "anyOf", "allOf"):
+                variants = prop.get(key)
+                if isinstance(variants, list):
+                    has_supported_variant = any(
+                        isinstance(variant, dict)
+                        and _resolve_schema_ref(spec, variant).get("type")
+                        in {"string", "number", "integer", "boolean", "object", "array", None}
+                        for variant in variants
+                    )
+
+            if prop_type in {"string", "number", "integer", "boolean", "object", "array", None} or has_supported_variant:
                 fields.append(name)
 
     return fields
@@ -125,7 +163,7 @@ def extract_endpoints(spec: Dict[str, Any], target_path: Optional[str] = None) -
             body_fields: List[str] = []
             for p in params:
                 if p.get("in") == "body" and isinstance(p.get("schema"), dict):
-                    body_fields.extend(_extract_body_fields_from_schema(p["schema"]))
+                    body_fields.extend(_extract_body_fields_from_schema(p["schema"], spec))
 
             # OpenAPI 3.x: requestBody -> content -> application/json
             if isinstance(meta, dict) and isinstance(meta.get("requestBody"), dict):
@@ -142,7 +180,7 @@ def extract_endpoints(spec: Dict[str, Any], target_path: Optional[str] = None) -
                                 json_media = v
                                 break
                     if isinstance(json_media, dict) and isinstance(json_media.get("schema"), dict):
-                        body_fields.extend(_extract_body_fields_from_schema(json_media["schema"]))
+                        body_fields.extend(_extract_body_fields_from_schema(json_media["schema"], spec))
 
             if not query_params and not body_fields:
                 continue
@@ -165,7 +203,7 @@ def _send_request(
     params: Dict[str, str],
     json_body: Optional[Dict[str, Any]] = None,
 ) -> ResponseInfo:
-    url = f"{base_url}{endpoint.path}"
+    url = _build_request_url(base_url, endpoint.path)
     start = time.time()
     try:
         resp = requests.request(
@@ -180,6 +218,10 @@ def _send_request(
     except requests.RequestException as e:
         elapsed = time.time() - start
         return ResponseInfo(status_code=0, body=str(e), elapsed=elapsed)
+
+
+def _build_request_url(base_url: str, path: str) -> str:
+    return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
 def _load_payloads_for_engine(engine: str, mode: str, payload_file: Optional[str] = None) -> List[str]:
@@ -238,10 +280,22 @@ def _load_payload_sets(
     return {"default": _load_payloads_for_engine(engine, mode, payload_file=None)}
 
 
-def build_test_cases(endpoints: List[Endpoint], payload_sets: Dict[str, List[str]]) -> List[TestCase]:
+def build_test_cases(
+    endpoints: List[Endpoint],
+    payload_sets: Dict[str, List[str]],
+    include_body_raw: bool = False,
+) -> List[TestCase]:
     cases: List[TestCase] = []
     for ep in endpoints:
         for payload_source, payloads in payload_sets.items():
+            json_body_payloads = []
+            if include_body_raw:
+                json_body_payloads = [
+                    payload
+                    for payload in payloads
+                    if _payload_as_json_body(payload) is not None
+                ]
+
             # parametros en query
             for param in ep.query_params:
                 for payload in payloads:
@@ -251,6 +305,19 @@ def build_test_cases(endpoints: List[Endpoint], payload_sets: Dict[str, List[str
                             param_name=param,
                             payload=payload,
                             param_location="query",
+                            payload_source=payload_source,
+                        )
+                    )
+
+            # cuerpo JSON completo: necesario para payloads Mango/_find y login JSON.
+            if include_body_raw and ep.body_fields:
+                for payload in json_body_payloads:
+                    cases.append(
+                        TestCase(
+                            endpoint=ep,
+                            param_name="__body__",
+                            payload=payload,
+                            param_location="body_raw",
                             payload_source=payload_source,
                         )
                     )
@@ -270,6 +337,37 @@ def build_test_cases(endpoints: List[Endpoint], payload_sets: Dict[str, List[str
     return cases
 
 
+def _payload_as_json_body(payload: str) -> Optional[Dict[str, Any]]:
+    try:
+        parsed = json.loads(payload)
+    except (TypeError, ValueError):
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _apply_payload(
+    params: Dict[str, str],
+    body: Dict[str, Any],
+    param_name: str,
+    param_location: str,
+    payload: str,
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    updated_params = params.copy()
+    updated_body = copy.deepcopy(body)
+
+    if param_location == "query":
+        updated_params[param_name] = payload
+    elif param_location == "body_raw":
+        parsed_body = _payload_as_json_body(payload)
+        updated_body = parsed_body if parsed_body is not None else updated_body
+    else:
+        parsed_value = _payload_as_json_body(payload)
+        updated_body[param_name] = parsed_value if parsed_value is not None else payload
+
+    return updated_params, updated_body
+
+
 def _run_single_test_case(base_url: str, test_case: TestCase, engine: str = "neo4j") -> TestResult:
     """Ejecuta un caso de prueba de inyección NoSQL.
     
@@ -281,17 +379,22 @@ def _run_single_test_case(base_url: str, test_case: TestCase, engine: str = "neo
     baseline_params = {name: "test" for name in test_case.endpoint.query_params}
     baseline_body = {name: "test" for name in test_case.endpoint.body_fields}
 
+    if test_case.param_location == "body_raw":
+        neutral_baseline = _payload_as_json_body(strategy.generate_neutral_payload(test_case.payload))
+        if neutral_baseline is not None:
+            baseline_body = neutral_baseline
+
     # Petición baseline
     baseline_resp = _send_request(base_url, test_case.endpoint, baseline_params, baseline_body or None)
 
     # Petición con payload
-    injected_params = baseline_params.copy()
-    injected_body = baseline_body.copy()
-
-    if test_case.param_location == "query":
-        injected_params[test_case.param_name] = test_case.payload
-    else:
-        injected_body[test_case.param_name] = test_case.payload
+    injected_params, injected_body = _apply_payload(
+        baseline_params,
+        baseline_body,
+        test_case.param_name,
+        test_case.param_location,
+        test_case.payload,
+    )
 
     injected_resp = _send_request(base_url, test_case.endpoint, injected_params, injected_body or None)
 
@@ -306,22 +409,27 @@ def _run_single_test_case(base_url: str, test_case: TestCase, engine: str = "neo
             neutral_payload = strategy.generate_neutral_payload(test_case.payload)
             
             # Preparar variantes
-            true_params = baseline_params.copy()
-            true_body = baseline_body.copy()
-            false_params = baseline_params.copy()
-            false_body = baseline_body.copy()
-            neutral_params = baseline_params.copy()
-            neutral_body = baseline_body.copy()
-            
-            param_attr = test_case.param_name
-            if test_case.param_location == "query":
-                true_params[param_attr] = true_payload
-                false_params[param_attr] = false_payload
-                neutral_params[param_attr] = neutral_payload
-            else:
-                true_body[param_attr] = true_payload
-                false_body[param_attr] = false_payload
-                neutral_body[param_attr] = neutral_payload
+            true_params, true_body = _apply_payload(
+                baseline_params,
+                baseline_body,
+                test_case.param_name,
+                test_case.param_location,
+                true_payload,
+            )
+            false_params, false_body = _apply_payload(
+                baseline_params,
+                baseline_body,
+                test_case.param_name,
+                test_case.param_location,
+                false_payload,
+            )
+            neutral_params, neutral_body = _apply_payload(
+                baseline_params,
+                baseline_body,
+                test_case.param_name,
+                test_case.param_location,
+                neutral_payload,
+            )
             
             true_resp = _send_request(base_url, test_case.endpoint, true_params, true_body or None)
             false_resp = _send_request(base_url, test_case.endpoint, false_params, false_body or None)
@@ -401,7 +509,12 @@ def run_detection(
     if not payload_sets or not any(payload_sets.values()):
         raise ValueError("No se cargaron payloads para el motor/modo especificados")
 
-    test_cases = build_test_cases(endpoints, payload_sets)
+    strategy = get_engine_strategy(engine)
+    test_cases = build_test_cases(
+        endpoints,
+        payload_sets,
+        include_body_raw=strategy.supports_body_raw_payloads(),
+    )
 
     results: List[TestResult] = []
 

@@ -55,6 +55,10 @@ class NoSQLEngineStrategy(ABC):
         """Análisis avanzado boolean-based."""
         return BooleanBasedAnalyzer.analyze_advanced(neutral, true_injected, false_injected)
 
+    def supports_body_raw_payloads(self) -> bool:
+        """Indica si el motor requiere probar payloads como cuerpo JSON completo."""
+        return False
+
 
 def get_engine_strategy(engine: str) -> NoSQLEngineStrategy:
     """Obtiene la estrategia especializada para un motor NoSQL."""
