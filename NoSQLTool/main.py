@@ -2,7 +2,7 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from .detection import TestResult, run_detection, summarize_vulnerabilities
+from .detection.detection import TestResult, run_detection, summarize_vulnerabilities
 
 
 @dataclass
