@@ -1,4 +1,3 @@
-import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -7,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 from .detection.detection import TestResult
 from .exploitation.exploitation import ExploitationResult, run_exploitation
 from .main import ScanConfig, run_scan
+from .reporting import InMemoryReportRepository, ReportHttpServer, ReportService
 
 ENGINE_OPTIONS: Dict[str, Tuple[str, str]] = {
     "1": ("neo4j", "Neo4j"),
@@ -20,9 +20,6 @@ DETECTION_OPTIONS: Dict[str, Optional[str]] = {
     "3": "time_based",
     "4": None,
 }
-
-REPORT_DIR_DEFAULT = "/tmp/reports"
-
 
 def _clear_screen() -> None:
     os.system("cls" if os.name == "nt" else "clear")
@@ -52,6 +49,44 @@ def _prompt_choice(prompt: str, choices: Dict[str, object]) -> str:
         if value in valid:
             return value
         print(f"Opcion invalida. Opciones permitidas: {', '.join(sorted(valid))}")
+
+
+def _get_report_port() -> int:
+    raw_port = os.getenv("REPORT_PORT", "8000")
+    try:
+        return int(raw_port)
+    except ValueError:
+        print(f"REPORT_PORT invalido ({raw_port}). Se utilizara 8000.")
+        return 8000
+
+
+def _build_report_server(repository: InMemoryReportRepository) -> ReportHttpServer:
+    port = _get_report_port()
+    return ReportHttpServer(
+        repository=repository,
+        host=os.getenv("REPORT_HOST", "0.0.0.0"),
+        port=port,
+        public_url=os.getenv("REPORT_PUBLIC_URL", f"http://localhost:{port}"),
+    )
+
+
+def _prompt_report_format(title: str) -> str:
+    print(f"\n{title}")
+    print("  1) JSON")
+    print("  2) TXT")
+    format_choice = _prompt_choice("Selecciona formato [1-2]: ", {"1": "json", "2": "txt"})
+    return "json" if format_choice == "1" else "txt"
+
+
+def _publish_report(report_server: ReportHttpServer, report) -> None:
+    report_server.start()
+    report_url = report_server.url_for(report)
+    raw_url = f"{report_url}/raw"
+
+    print(f"\nReporte disponible en: {report_url}")
+    print(f"Contenido raw: {raw_url}")
+    print("No se guardo en disco; estara en memoria mientras el CLI siga activo.")
+    input("\nPresiona Enter para continuar...")
 
 
 def _build_swagger_path() -> str:
@@ -137,60 +172,6 @@ def _print_summary(summary: Dict[str, Dict[str, List[str]]]) -> None:
                 print(f"      - {payload}")
 
 
-def _build_flag_based_report(
-    last_results: List[TestResult],
-    last_summary: Dict[str, Dict[str, List[str]]],
-) -> Dict[str, object]:
-    """Construye un reporte basado en banderas (flags).
-    
-    Agrupa endpoints vulnerables por tipo de detección, mostrando de forma
-    simplificada qué endpoints son vulnerables a qué tipo de ataque.
-    """
-    # Estructura: endpoint -> set de tipos de detección vulnerables
-    vulnerable_endpoints: Dict[str, Dict[str, object]] = {}
-    
-    # Procesar resultados vulnerables
-    for result in last_results:
-        if not result.vulnerable:
-            continue
-            
-        endpoint_key = f"{result.endpoint.method} {result.endpoint.path}"
-        
-        if endpoint_key not in vulnerable_endpoints:
-            vulnerable_endpoints[endpoint_key] = {
-                "endpoint": endpoint_key,
-                "vulnerabilities": set(),
-                "vulnerable_parameters": {}
-            }
-        
-        # Agregar tipo de detección
-        vuln_entry = vulnerable_endpoints[endpoint_key]
-        vuln_entry["vulnerabilities"].add(result.payload_source)
-        
-        # Rastrear parámetros por tipo de detección
-        if result.param_name not in vuln_entry["vulnerable_parameters"]:
-            vuln_entry["vulnerable_parameters"][result.param_name] = set()
-        vuln_entry["vulnerable_parameters"][result.param_name].add(result.payload_source)
-    
-    # Convertir sets a listas ordenadas para JSON
-    flag_report = {
-        "vulnerable_endpoints": []
-    }
-    
-    for endpoint_key in sorted(vulnerable_endpoints.keys()):
-        entry = vulnerable_endpoints[endpoint_key]
-        flag_report["vulnerable_endpoints"].append({
-            "endpoint": entry["endpoint"],
-            "vulnerabilities": sorted(list(entry["vulnerabilities"])),
-            "vulnerable_parameters": {
-                param: sorted(list(detections))
-                for param, detections in entry["vulnerable_parameters"].items()
-            }
-        })
-    
-    return flag_report
-
-
 def _run_detection_flow() -> Tuple[Optional[List[TestResult]], Optional[Dict[str, Dict[str, List[str]]]], Optional[dict]]:
     _clear_screen()
     print("=== Modulo de Deteccion NoSQL ===")
@@ -263,6 +244,8 @@ def _generate_report_flow(
     last_results: Optional[List[TestResult]],
     last_summary: Optional[Dict[str, Dict[str, List[str]]]],
     last_metadata: Optional[dict],
+    report_service: ReportService,
+    report_server: ReportHttpServer,
 ) -> None:
     _clear_screen()
     print("=== Generador de Reportes ===")
@@ -270,59 +253,17 @@ def _generate_report_flow(
     if last_results is None or last_summary is None or last_metadata is None:
         print("\nNo hay resultados de deteccion en memoria.")
         print("Ejecuta primero una deteccion para poder generar el reporte.")
+        input("\nPresiona Enter para continuar...")
         return
 
-    print("\nFormato de reporte")
-    print("  1) JSON")
-    print("  2) TXT")
-    format_choice = _prompt_choice("Selecciona formato [1-2]: ", {"1": "json", "2": "txt"})
-
-    report_dir = Path(_prompt_non_empty(f"Directorio de salida [{REPORT_DIR_DEFAULT}]: ", REPORT_DIR_DEFAULT))
-    report_dir.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # ====== REPORTE POR BANDERAS ======
-    flag_report = _build_flag_based_report(last_results, last_summary)
-    
-    if format_choice == "1":
-        report_path = report_dir / f"nosql_report_{timestamp}.json"
-        report_payload = {
-            "metadata": last_metadata,
-            "flags_report": flag_report
-        }
-        report_path.write_text(json.dumps(report_payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    else:
-        report_path = report_dir / f"nosql_report_{timestamp}.txt"
-        lines: List[str] = []
-        lines.append("REPORTE DE DETECCION NOSQL - BANDERAS (FLAGS)")
-        lines.append("=" * 50)
-        lines.append("")
-        lines.append(f"Fecha: {last_metadata['executed_at']}")
-        lines.append(f"Motor: {last_metadata['engine_label']}")
-        lines.append(f"API: {last_metadata['base_url']}")
-        lines.append(f"Tipo de deteccion: {last_metadata['detection_type']}")
-        lines.append("")
-
-        if not flag_report["vulnerable_endpoints"]:
-            lines.append("No se detectaron endpoints vulnerables.")
-        else:
-            lines.append(f"Total endpoints vulnerables: {len(flag_report['vulnerable_endpoints'])}")
-            lines.append("")
-            
-            for endpoint_entry in flag_report["vulnerable_endpoints"]:
-                lines.append(f"[*] {endpoint_entry['endpoint']}")
-                lines.append(f"    Vulnerable a: {', '.join(endpoint_entry['vulnerabilities'])}")
-                
-                if endpoint_entry['vulnerable_parameters']:
-                    lines.append("    Parámetros afectados:")
-                    for param, vuln_types in endpoint_entry['vulnerable_parameters'].items():
-                        lines.append(f"      - {param}: {', '.join(vuln_types)}")
-                lines.append("")
-
-        report_path.write_text("\n".join(lines), encoding="utf-8")
-
-    print(f"\nReporte generado en: {report_path}")
+    format_name = _prompt_report_format("Formato de reporte")
+    report = report_service.create_detection_report(
+        format_name,
+        last_results,
+        last_summary,
+        last_metadata,
+    )
+    _publish_report(report_server, report)
 
 
 def _run_exploitation_flow(
@@ -392,6 +333,8 @@ def _run_exploitation_flow(
 def _generate_exploitation_report(
     exploitation_results: Optional[List[ExploitationResult]],
     detection_metadata: Optional[dict],
+    report_service: ReportService,
+    report_server: ReportHttpServer,
 ) -> None:
     """Genera reporte de explotación con evidencia detallada."""
     _clear_screen()
@@ -399,152 +342,16 @@ def _generate_exploitation_report(
 
     if exploitation_results is None or not exploitation_results:
         print("\nNo hay resultados de explotacion.")
+        input("\nPresiona Enter para continuar...")
         return
 
-    print("\nFormato de reporte")
-    print("  1) JSON (Detallado con evidencia)")
-    print("  2) TXT (Legible)")
-    format_choice = _prompt_choice("Selecciona formato [1-2]: ", {"1": "json", "2": "txt"})
-
-    report_dir = Path(_prompt_non_empty(f"Directorio de salida [{REPORT_DIR_DEFAULT}]: ", REPORT_DIR_DEFAULT))
-    report_dir.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    if format_choice == "1":
-        report_path = report_dir / f"nosql_exploitation_{timestamp}.json"
-        
-        report_data = {
-            "metadata": {
-                **detection_metadata,
-                "exploitation_timestamp": timestamp,
-                "total_exploited": len(exploitation_results),
-            },
-            "exploitation_results": [
-                {
-                    "endpoint": f"{r.endpoint.method} {r.endpoint.path}",
-                    "parameter": r.param_name,
-                    "exploitation_type": r.exploitation_type,
-                    "successful": r.successful,
-                    "metrics": {
-                        "extraction_type": r.metrics.extraction_type,
-                        "data_extracted": r.metrics.data_extracted[:200],  # Limitar tamaño
-                        "data_length": r.metrics.data_length,
-                        "confidence": round(r.metrics.confidence, 3),
-                        "validity_score": round(r.metrics.validity_score, 3),
-                        "attempts": r.metrics.attempts,
-                        "elapsed_time": round(r.metrics.elapsed_time, 2),
-                        "extracted_fields": r.metrics.extracted_fields,
-                        "confirmation_signals": r.metrics.confirmation_signals,
-                    },
-                    "evidence": [
-                        {
-                            "baseline": {
-                                "status_code": e.baseline_response.status_code,
-                                "response_size": e.baseline_response.response_size,
-                                "elapsed_time": round(e.baseline_response.elapsed_time, 3),
-                                "snippet": e.baseline_response.snippet[:200],
-                            },
-                            "injected": {
-                                "status_code": e.injected_response.status_code,
-                                "response_size": e.injected_response.response_size,
-                                "elapsed_time": round(e.injected_response.elapsed_time, 3),
-                                "snippet": e.injected_response.snippet[:200],
-                            },
-                            "payload": e.payload_used,
-                            "injection_point": e.injection_point,
-                            "difference": e.difference_description,
-                        }
-                        for e in r.metrics.evidence_list
-                    ],
-                    "data_samples": r.data_samples[:3],
-                    "description": r.description,
-                }
-                for r in exploitation_results
-            ]
-        }
-        
-        report_path.write_text(json.dumps(report_data, indent=2, ensure_ascii=False), encoding="utf-8")
-    
-    else:
-        report_path = report_dir / f"nosql_exploitation_{timestamp}.txt"
-        lines: List[str] = []
-        
-        lines.append("REPORTE DE EXPLOTACION NOSQL - EVIDENCIA DETALLADA")
-        lines.append("=" * 80)
-        lines.append("")
-        lines.append(f"Fecha: {detection_metadata['executed_at']}")
-        lines.append(f"Motor: {detection_metadata['engine_label']}")
-        lines.append(f"API: {detection_metadata['base_url']}")
-        lines.append(f"Total de endpoints explotados: {len(exploitation_results)}")
-        lines.append(f"Timestamp de explotación: {timestamp}")
-        lines.append("")
-        
-        for idx, expl_result in enumerate(exploitation_results, 1):
-            lines.append(f"\n{'=' * 80}")
-            lines.append(f"[{idx}] {expl_result.endpoint.method} {expl_result.endpoint.path}")
-            lines.append(f"{'=' * 80}")
-            lines.append("")
-            
-            lines.append(f"Parámetro objetivo: {expl_result.param_name}")
-            lines.append(f"Tipo de explotación: {expl_result.exploitation_type.upper()}")
-            lines.append(f"Estado: {'✓ EXITOSA' if expl_result.successful else '✗ FALLIDA'}")
-            lines.append("")
-            
-            # Métricas principales
-            lines.append("MÉTRICAS DE EXPLOTACIÓN:")
-            lines.append(f"  • Confianza: {expl_result.metrics.confidence:.1%}")
-            lines.append(f"  • Validez de datos: {expl_result.metrics.validity_score:.1%}")
-            lines.append(f"  • Datos extraídos: {expl_result.metrics.data_length} caracteres")
-            lines.append(f"  • Intentos realizados: {expl_result.metrics.attempts}")
-            lines.append(f"  • Tiempo total: {expl_result.metrics.elapsed_time:.2f} segundos")
-            if expl_result.metrics.confirmation_signals:
-                signal_text = ", ".join(
-                    f"{name}={count}"
-                    for name, count in expl_result.metrics.confirmation_signals.items()
-                )
-                lines.append(f"  • Señales de confirmación: {signal_text}")
-            lines.append("")
-            
-            # Evidencia detallada
-            if expl_result.metrics.evidence_list:
-                lines.append("EVIDENCIA TÉCNICA:")
-                for evi_idx, evidence in enumerate(expl_result.metrics.evidence_list[:3], 1):
-                    lines.append(f"\n  Intento #{evi_idx}:")
-                    lines.append(f"  ├─ Payload: {evidence.payload_used[:80]}")
-                    lines.append(f"  ├─ Punto de inyección: {evidence.injection_point}")
-                    lines.append(f"  │")
-                    lines.append(f"  ├─ RESPUESTA BASE (sin inyección):")
-                    lines.append(f"  │  • HTTP Status: {evidence.baseline_response.status_code}")
-                    lines.append(f"  │  • Tamaño: {evidence.baseline_response.response_size} bytes")
-                    lines.append(f"  │  • Tiempo: {evidence.baseline_response.elapsed_time:.3f} segundos")
-                    lines.append(f"  │  • Snippet: {evidence.baseline_response.snippet[:100]}...")
-                    lines.append(f"  │")
-                    lines.append(f"  ├─ RESPUESTA INYECTADA:")
-                    lines.append(f"  │  • HTTP Status: {evidence.injected_response.status_code}")
-                    lines.append(f"  │  • Tamaño: {evidence.injected_response.response_size} bytes")
-                    lines.append(f"  │  • Tiempo: {evidence.injected_response.elapsed_time:.3f} segundos")
-                    lines.append(f"  │  • Snippet: {evidence.injected_response.snippet[:100]}...")
-                    lines.append(f"  │")
-                    lines.append(f"  └─ ANÁLISIS:")
-                    lines.append(f"     {evidence.difference_description}")
-                lines.append("")
-            
-            # Datos extraídos
-            if expl_result.metrics.data_extracted:
-                lines.append("DATOS EXTRAÍDOS:")
-                extracted = expl_result.metrics.data_extracted
-                display = extracted[:150] + "..." if len(extracted) > 150 else extracted
-                lines.append(f"  {display}")
-                lines.append("")
-            
-            # Descripción
-            lines.append(f"DESCRIPCIÓN: {expl_result.description}")
-            lines.append("")
-        
-        report_path.write_text("\n".join(lines), encoding="utf-8")
-    
-    print(f"\n✓ Reporte generado en: {report_path}")
+    format_name = _prompt_report_format("Formato de reporte")
+    report = report_service.create_exploitation_report(
+        format_name,
+        exploitation_results,
+        detection_metadata,
+    )
+    _publish_report(report_server, report)
 
 
 def run_cli() -> None:
@@ -553,6 +360,9 @@ def run_cli() -> None:
     last_metadata: Optional[dict] = None
     last_exploitation_results: Optional[List[ExploitationResult]] = None
     last_base_url: Optional[str] = None
+    report_repository = InMemoryReportRepository()
+    report_service = ReportService(report_repository)
+    report_server = _build_report_server(report_repository)
 
     while True:
         _clear_screen()
@@ -579,7 +389,13 @@ def run_cli() -> None:
 
         elif option == "2":
             try:
-                _generate_report_flow(last_results, last_summary, last_metadata)
+                _generate_report_flow(
+                    last_results,
+                    last_summary,
+                    last_metadata,
+                    report_service,
+                    report_server,
+                )
             except Exception as exc:
                 print(f"\nError al generar el reporte: {exc}")
                 input("\nPresiona Enter para continuar...")
@@ -595,7 +411,12 @@ def run_cli() -> None:
 
         elif option == "4":
             try:
-                _generate_exploitation_report(last_exploitation_results, last_metadata)
+                _generate_exploitation_report(
+                    last_exploitation_results,
+                    last_metadata,
+                    report_service,
+                    report_server,
+                )
             except Exception as exc:
                 print(f"\nError al generar el reporte de explotacion: {exc}")
                 input("\nPresiona Enter para continuar...")
