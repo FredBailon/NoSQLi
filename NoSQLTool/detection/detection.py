@@ -78,16 +78,57 @@ def _build_base_url(spec: Dict[str, Any]) -> str:
     raise ValueError("No se pudo determinar la URL base de la API desde el swagger.json")
 
 
-def _extract_body_fields_from_schema(schema: Dict[str, Any]) -> List[str]:
+def _resolve_ref(ref: str, spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Resuelve una referencia $ref en el Swagger.
+    
+    Ejemplo: "#/components/schemas/LoginRequest" -> devuelve el schema
+    
+    Args:
+        ref: Cadena con la referencia (ej: "#/components/schemas/LoginRequest")
+        spec: El Swagger completo
+    
+    Returns:
+        El esquema resuelto o None si no se encuentra
+    """
+    if not isinstance(ref, str) or not ref.startswith("#/"):
+        return None
+    
+    # Dividir la ruta: "#/components/schemas/LoginRequest" -> ["", "components", "schemas", "LoginRequest"]
+    parts = ref.split("/")[1:]  # Saltar el "#"
+    
+    current = spec
+    for part in parts:
+        if isinstance(current, dict):
+            current = current.get(part)
+        else:
+            return None
+    
+    return current if isinstance(current, dict) else None
+
+
+def _extract_body_fields_from_schema(schema: Dict[str, Any], spec: Optional[Dict[str, Any]] = None) -> List[str]:
     """Extrae nombres de campos de primer nivel del cuerpo JSON.
 
     Se centra en esquemas tipo object y propiedades simples (string, number, etc.).
+    Resuelve referencias $ref si el spec se proporciona.
+    
+    Args:
+        schema: El esquema a procesar
+        spec: El Swagger completo (opcional, para resolver $ref)
     """
     fields: List[str] = []
 
     if not isinstance(schema, dict):
         return fields
 
+    # Resolver $ref si existe
+    if "$ref" in schema and spec is not None:
+        resolved = _resolve_ref(schema["$ref"], spec)
+        if resolved:
+            schema = resolved
+        else:
+            return fields
+    
     if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
         for name, prop in schema["properties"].items():
             if not isinstance(prop, dict):
@@ -125,7 +166,7 @@ def extract_endpoints(spec: Dict[str, Any], target_path: Optional[str] = None) -
             body_fields: List[str] = []
             for p in params:
                 if p.get("in") == "body" and isinstance(p.get("schema"), dict):
-                    body_fields.extend(_extract_body_fields_from_schema(p["schema"]))
+                    body_fields.extend(_extract_body_fields_from_schema(p["schema"], spec=spec))
 
             # OpenAPI 3.x: requestBody -> content -> application/json
             if isinstance(meta, dict) and isinstance(meta.get("requestBody"), dict):
@@ -142,7 +183,7 @@ def extract_endpoints(spec: Dict[str, Any], target_path: Optional[str] = None) -
                                 json_media = v
                                 break
                     if isinstance(json_media, dict) and isinstance(json_media.get("schema"), dict):
-                        body_fields.extend(_extract_body_fields_from_schema(json_media["schema"]))
+                        body_fields.extend(_extract_body_fields_from_schema(json_media["schema"], spec=spec))
 
             if not query_params and not body_fields:
                 continue
