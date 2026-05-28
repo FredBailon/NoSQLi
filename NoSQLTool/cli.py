@@ -11,7 +11,7 @@ from .main import ScanConfig, run_scan
 ENGINE_OPTIONS: Dict[str, Tuple[str, str]] = {
     "1": ("neo4j", "Neo4j"),
     "2": ("couchdb", "CouchDB"),
-    "3": ("mongodb", "MongoDB"),
+    "3": ("mongo", "Mongo"),
 }
 
 DETECTION_OPTIONS: Dict[str, Optional[str]] = {
