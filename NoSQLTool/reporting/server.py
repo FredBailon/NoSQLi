@@ -103,20 +103,27 @@ class ReportHttpServer:
                     return
 
                 if parts[2] == "raw":
-                    self._write_report(report)
+                    # Serve as inline (view in browser)
+                    self._write_report(report, as_attachment=False)
+                    return
+
+                if parts[2] == "download":
+                    # Force download
+                    self._write_report(report, as_attachment=True)
                     return
 
                 self._write_html(404, self._render_not_found())
 
-            def _write_report(self, report: ReportDocument) -> None:
+            def _write_report(self, report: ReportDocument, as_attachment: bool = False) -> None:
                 content = report.content.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", report.content_type)
                 self.send_header("Content-Length", str(len(content)))
                 self.send_header("X-Content-Type-Options", "nosniff")
+                disposition_type = "attachment" if as_attachment else "inline"
                 self.send_header(
                     "Content-Disposition",
-                    f'inline; filename="{report.filename}"',
+                    f'{disposition_type}; filename="{report.filename}"',
                 )
                 self.end_headers()
                 self.wfile.write(content)
@@ -132,19 +139,37 @@ class ReportHttpServer:
 
             def _render_index(self) -> str:
                 reports = repository.list_all()
-                items = "\n".join(
-                    (
-                        "<li>"
-                        f"<a href=\"{report.route}\">{escape(report.title)}</a>"
-                        f" <small>{escape(report.kind)} / {escape(report.format)}"
-                        f" / {escape(report.created_at.isoformat(timespec='seconds'))}"
-                        "</small>"
-                        "</li>"
-                    )
-                    for report in reports
-                )
-                if not items:
+                if not reports:
                     items = "<li>No hay reportes en memoria.</li>"
+                else:
+                    rows = []
+                    for report in reports:
+                        rows.append(
+                            "<tr>"
+                            f"<td><a href=\"{report.route}\">{escape(report.title)}</a></td>"
+                            f"<td>{escape(report.kind)}</td>"
+                            f"<td>{escape(report.format)}</td>"
+                            f"<td>{escape(report.filename)}</td>"
+                            f"<td>{escape(report.created_at.isoformat(timespec='seconds'))}</td>"
+                            f"<td><a href=\"{report.route}\">Abrir</a> | "
+                            f"<a href=\"{report.route}/raw\">Raw</a> | "
+                            f"<a href=\"{report.route}/download\">Descargar</a></td>"
+                            "</tr>"
+                        )
+
+                    items = (
+                        "<table style=\"width:100%;border-collapse:collapse\">"
+                        "<thead><tr>"
+                        "<th align=\"left\">Titulo</th>"
+                        "<th align=\"left\">Tipo</th>"
+                        "<th align=\"left\">Formato</th>"
+                        "<th align=\"left\">Archivo</th>"
+                        "<th align=\"left\">Creado</th>"
+                        "<th align=\"left\">Acciones</th>"
+                        "</tr></thead>"
+                        f"<tbody>{''.join(rows)}</tbody>"
+                        "</table>"
+                    )
 
                 return self._page(
                     "Reportes NoSQLTool",
@@ -152,19 +177,22 @@ class ReportHttpServer:
                         "<h1>Reportes NoSQLTool</h1>"
                         "<p>Los reportes se conservan solo en memoria mientras "
                         "el CLI esta en ejecucion.</p>"
-                        f"<ul>{items}</ul>"
+                        f"{items}"
                     ),
                 )
 
             def _render_report(self, report: ReportDocument) -> str:
                 raw_url = f"{report.route}/raw"
+                download_url = f"{report.route}/download"
                 return self._page(
                     report.title,
                     (
                         f"<p><a href=\"/reports\">Volver</a> | "
-                        f"<a href=\"{raw_url}\">Ver contenido raw</a></p>"
+                        f"<a href=\"{raw_url}\">Ver contenido raw</a> | "
+                        f"<a href=\"{download_url}\">Descargar</a></p>"
                         f"<h1>{escape(report.title)}</h1>"
                         f"<p><strong>Formato:</strong> {escape(report.format)} "
+                        f"<strong>Archivo:</strong> {escape(report.filename)} "
                         f"<strong>Creado:</strong> "
                         f"{escape(report.created_at.isoformat(timespec='seconds'))}</p>"
                         f"<pre>{escape(report.content)}</pre>"

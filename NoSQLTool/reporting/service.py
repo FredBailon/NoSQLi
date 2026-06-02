@@ -43,7 +43,7 @@ class ReportService:
         created_at = datetime.now()
         content = renderer.render(results, summary, metadata)
         report = self._build_document(
-            title="Reporte de deteccion NoSQL",
+            title=f"Reporte de deteccion NoSQL API: {metadata['base_url']}",
             kind="detection",
             renderer=renderer,
             content=content,
@@ -62,7 +62,7 @@ class ReportService:
         created_at = datetime.now()
         content = renderer.render(results, metadata)
         report = self._build_document(
-            title="Reporte de explotacion NoSQL",
+            title=f"Reporte de explotacion NoSQL API: {metadata['base_url']}",
             kind="exploitation",
             renderer=renderer,
             content=content,

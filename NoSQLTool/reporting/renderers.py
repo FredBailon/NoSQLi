@@ -109,12 +109,12 @@ class DetectionTextRenderer:
     ) -> str:
         flag_report = build_flag_based_report(results, summary)
         lines: List[str] = []
-        lines.append("REPORTE DE DETECCION NOSQL - BANDERAS (FLAGS)")
+        lines.append(f"REPORTE DE DETECCION NOSQL - BANDERAS (FLAGS) ")
         lines.append("=" * 50)
         lines.append("")
         lines.append(f"Fecha: {metadata['executed_at']}")
         lines.append(f"Motor: {metadata['engine_label']}")
-        lines.append(f"API: {metadata['base_url']}")
+        #lines.append(f"API: {metadata['base_url']}")
         lines.append(f"Tipo de deteccion: {metadata['detection_type']}")
         lines.append("")
 
@@ -226,12 +226,14 @@ class ExploitationTextRenderer:
         safe_metadata = metadata or {}
         lines: List[str] = []
 
-        lines.append("REPORTE DE EXPLOTACION NOSQL - EVIDENCIA DETALLADA")
+        lines.append(
+            f"REPORTE DE EXPLOTACION NOSQL - EVIDENCIA DETALLADA "
+        )
         lines.append("=" * 80)
         lines.append("")
         lines.append(f"Fecha: {safe_metadata.get('executed_at', 'n/a')}")
         lines.append(f"Motor: {safe_metadata.get('engine_label', 'n/a')}")
-        lines.append(f"API: {safe_metadata.get('base_url', 'n/a')}")
+        #lines.append(f"API: {safe_metadata.get('base_url', 'n/a')}")
         lines.append(f"Total de endpoints explotados: {len(results)}")
         lines.append("")
 
