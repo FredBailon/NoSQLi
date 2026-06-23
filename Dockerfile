@@ -15,7 +15,11 @@ RUN mkdir -p /tmp/swagger \
 
 ENV PYTHONUNBUFFERED=1 \
     SWAGGER_DIR=/tmp/swagger \
-    SWAGGER_FILENAME=swagger.json
+    SWAGGER_FILENAME=swagger.json \
+    REPORT_HOST=0.0.0.0 \
+    REPORT_PORT=8000
+
+EXPOSE 8000
 
 # Comando por defecto: ejecutar el main del paquete
 CMD ["python", "-m", "NoSQLTool.main"]
