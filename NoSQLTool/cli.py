@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .detection.detection import TestResult
 from .exploitation.exploitation import ExploitationResult, run_exploitation
-from .main import ScanConfig, run_scan
+from .NoSQLTool import ScanConfig, run_scan
 from .reporting import InMemoryReportRepository, ReportHttpServer, ReportService
 
 ENGINE_OPTIONS: Dict[str, Tuple[str, str]] = {
