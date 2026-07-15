@@ -1,7 +1,19 @@
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+if __package__ in {None, ""}:
+    package_dir = Path(__file__).resolve().parent
+    project_root = package_dir.parent
+    sys.path = [
+        entry
+        for entry in sys.path
+        if Path(entry or ".").resolve() != package_dir
+    ]
+    sys.path.insert(0, str(project_root))
+    __package__ = package_dir.name
 
 from .detection.detection import TestResult
 from .exploitation.exploitation import ExploitationResult, run_exploitation
