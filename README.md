@@ -281,40 +281,4 @@ compose.yaml
 requirements.txt
 ```
 
-## Solucion de problemas
 
-### No se encuentra el Swagger
-
-Verifica que `SWAGGER_PATH` apunte a un archivo existente:
-
-```powershell
-Test-Path $env:SWAGGER_PATH
-```
-
-Con Docker Compose, recuerda definir `SWAGGER_PATH` antes de ejecutar el
-servicio.
-
-### La API no responde desde Docker
-
-Si la API corre en tu maquina host, no uses `localhost` dentro del contenedor.
-Usa:
-
-```text
-http://host.docker.internal:<puerto>
-```
-
-### No se descargan los payloads
-
-Revisa conectividad hacia `PAYLOAD_BASE_URL` o configura una URL propia.
-Tambien valida que el contenedor tenga permiso de escritura en `CACHE_DIR`.
-
-### El puerto de reportes esta ocupado
-
-Cambia el puerto publicado en `compose.yaml` o libera el puerto `8000` antes de
-iniciar la herramienta.
-
-### No aparecen vulnerabilidades
-
-Confirma que el Swagger describe los endpoints correctos, que `BASE_URL` apunta
-a la API esperada y que el endpoint objetivo, si fue definido, coincide con la
-ruta documentada.
